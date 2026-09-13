@@ -5,6 +5,7 @@
 #include <SPI.h>
 #include <Wire.h>
 #include <U8g2lib.h>
+#include <Preferences.h>
 #include <vector>
 
 // I2S DOUT uses GPIO 27; I2C remains on SDA 21 and SCL 22.
@@ -21,6 +22,8 @@
 #define LONG_PRESS_MS 800
 #define BROWSER_RETURN_MS 1500
 #define SEEK_BYTES_10_SECONDS 160000UL
+#define STATE_SAVE_INTERVAL_MS 12000UL
+#define APPROXIMATE_MP3_BYTES_PER_SECOND 16000UL
 
 enum Screen : uint8_t {
 	SCREEN_BROWSER,
@@ -69,6 +72,13 @@ volatile bool playbackStopped = false;
 float currentGain = 0.05f;
 float gainBeforeMute = 0.05f;
 bool muted = false;
+Preferences preferences;
+bool shuffleEnabled = false;
+volatile uint32_t currentPositionSec = 0;
+uint32_t trackPositionBaseSec = 0;
+uint32_t playbackReferenceMillis = 0;
+volatile bool stateSaveRequested = false;
+uint32_t lastStateSaveMillis = 0;
 
 void IRAM_ATTR handleNextISR() {
 	if (digitalRead(NEXT_BUTTON_PIN) == LOW) {
@@ -142,6 +152,67 @@ bool scanDirectory(const char *path) {
 	return true;
 }
 
+void requestStateSave() {
+	stateSaveRequested = true;
+}
+
+void updatePlaybackPosition() {
+	if (playbackPaused || playbackStopped) return;
+	uint32_t elapsed = (millis() - playbackReferenceMillis) / 1000;
+	xSemaphoreTake(stateMutex, portMAX_DELAY);
+	currentPositionSec = trackPositionBaseSec + elapsed;
+	xSemaphoreGive(stateMutex);
+}
+
+void resetPlaybackPosition(uint32_t positionSec = 0) {
+	trackPositionBaseSec = positionSec;
+	playbackReferenceMillis = millis();
+	currentPositionSec = positionSec;
+}
+
+void saveStateToNvs() {
+	String folder;
+	uint16_t trackIndex;
+	uint32_t position;
+	float gain;
+	bool shuffle;
+
+	xSemaphoreTake(stateMutex, portMAX_DELAY);
+	folder = currentDirectory;
+	trackIndex = static_cast<uint16_t>(currentTrack);
+	position = currentPositionSec;
+	shuffle = shuffleEnabled;
+	xSemaphoreGive(stateMutex);
+	xSemaphoreTake(audioMutex, portMAX_DELAY);
+	gain = currentGain;
+	xSemaphoreGive(audioMutex);
+
+	preferences.putString("lastFolder", folder);
+	preferences.putUShort("lastTrackIndex", trackIndex);
+	preferences.putUInt("lastPositionSec", position);
+	preferences.putFloat("lastVolume", gain);
+	preferences.putBool("shuffle", shuffle);
+	stateSaveRequested = false;
+	lastStateSaveMillis = millis();
+}
+
+void restorePosition(uint32_t positionSec) {
+	xSemaphoreTake(audioMutex, portMAX_DELAY);
+	xSemaphoreTake(sdMutex, portMAX_DELAY);
+	if (f) {
+		uint32_t fileSize = f.size();
+		// BackgroundAudioMP3 has no time index; use a bitrate-based byte estimate.
+		uint64_t approximateOffset = static_cast<uint64_t>(positionSec) * APPROXIMATE_MP3_BYTES_PER_SECOND;
+		if (fileSize > 0 && approximateOffset >= fileSize) approximateOffset = fileSize - 1;
+		if (f.seek(static_cast<uint32_t>(approximateOffset))) {
+			mp3.flush();
+		}
+	}
+	xSemaphoreGive(sdMutex);
+	xSemaphoreGive(audioMutex);
+	resetPlaybackPosition(positionSec);
+}
+
 bool openTrack(size_t idx) {
 	if (tracks.empty()) return false;
 	if (idx >= tracks.size()) idx = 0;
@@ -161,7 +232,36 @@ bool openTrack(size_t idx) {
 		Serial.println("Nie można otworzyć pliku");
 		return false;
 	}
+	resetPlaybackPosition();
 	return true;
+}
+
+bool loadPlaylistFromDirectory(const String &path, size_t selectedIndex) {
+	if (!scanDirectory(path.c_str())) return false;
+
+	std::vector<String> playlist;
+	for (const DirectoryEntry &entry : directoryEntries) {
+		if (!entry.isDirectory && !entry.isParent) {
+			playlist.push_back(joinPath(path, entry.name));
+		}
+	}
+	if (playlist.empty()) return false;
+	if (selectedIndex >= playlist.size()) selectedIndex = 0;
+
+	xSemaphoreTake(stateMutex, portMAX_DELAY);
+	currentDirectory = path;
+	tracks = playlist;
+	currentTrack = selectedIndex;
+	bool opened = openTrack(currentTrack);
+	if (opened) {
+		xSemaphoreTake(audioMutex, portMAX_DELAY);
+		playbackStopped = false;
+		playbackPaused = false;
+		mp3.unpause();
+		xSemaphoreGive(audioMutex);
+	}
+	xSemaphoreGive(stateMutex);
+	return opened;
 }
 
 void advanceTrack() {
@@ -174,6 +274,7 @@ void advanceTrack() {
 	mp3.unpause();
 	xSemaphoreGive(audioMutex);
 	xSemaphoreGive(stateMutex);
+	requestStateSave();
 }
 
 void closeTrack() {
@@ -194,6 +295,7 @@ void retreatTrack() {
 	mp3.unpause();
 	xSemaphoreGive(audioMutex);
 	xSemaphoreGive(stateMutex);
+	requestStateSave();
 }
 
 void togglePlayPause() {
@@ -207,6 +309,7 @@ void togglePlayPause() {
 		return;
 	}
 
+	updatePlaybackPosition();
 	xSemaphoreTake(audioMutex, portMAX_DELAY);
 	if (playbackPaused) {
 		mp3.unpause();
@@ -216,6 +319,7 @@ void togglePlayPause() {
 		playbackPaused = true;
 	}
 	xSemaphoreGive(audioMutex);
+	requestStateSave();
 }
 
 void stopPlayback() {
@@ -230,6 +334,8 @@ void stopPlayback() {
 	playbackStopped = true;
 	playbackPaused = true;
 	xSemaphoreGive(audioMutex);
+	resetPlaybackPosition();
+	requestStateSave();
 }
 
 void seekByBytes(int32_t delta) {
@@ -243,11 +349,14 @@ void seekByBytes(int32_t delta) {
 		if (fileSize > 0 && target >= fileSize) target = fileSize - 1;
 		if (f.seek(static_cast<uint32_t>(target))) {
 			mp3.flush();
+			uint32_t estimatedPosition = static_cast<uint32_t>(target / APPROXIMATE_MP3_BYTES_PER_SECOND);
+			resetPlaybackPosition(estimatedPosition);
 			Serial.println(delta > 0 ? "Fast forward 10 s" : "Rewind 10 s");
 		}
 	}
 	xSemaphoreGive(sdMutex);
 	xSemaphoreGive(audioMutex);
+	requestStateSave();
 }
 
 void volumeUp() {
@@ -255,6 +364,7 @@ void volumeUp() {
 	currentGain = min(currentGain + 0.01f, 1.0f);
 	if (!muted) mp3.setGain(currentGain);
 	xSemaphoreGive(audioMutex);
+	requestStateSave();
 }
 
 void volumeDown() {
@@ -262,6 +372,7 @@ void volumeDown() {
 	currentGain = max(currentGain - 0.01f, 0.0f);
 	if (!muted) mp3.setGain(currentGain);
 	xSemaphoreGive(audioMutex);
+	requestStateSave();
 }
 
 void toggleMute() {
@@ -276,6 +387,7 @@ void toggleMute() {
 		muted = true;
 	}
 	xSemaphoreGive(audioMutex);
+	requestStateSave();
 }
 
 void refreshBrowser() {
@@ -358,6 +470,7 @@ void selectBrowserEntry() {
 		mp3.unpause();
 		xSemaphoreGive(audioMutex);
 		currentScreen = SCREEN_NOWPLAYING;
+		requestStateSave();
 		displayDirty = true;
 	}
 	xSemaphoreGive(stateMutex);
@@ -368,6 +481,7 @@ void audioFeedTask(void *parameter) {
 	for (;;) {
 		bool fedData = false;
 		bool reachedEnd = false;
+		updatePlaybackPosition();
 
 		xSemaphoreTake(audioMutex, portMAX_DELAY);
 		xSemaphoreTake(sdMutex, portMAX_DELAY);
@@ -390,6 +504,7 @@ void audioFeedTask(void *parameter) {
 		if (!fedData) vTaskDelay(pdMS_TO_TICKS(10));
 
 		if (reachedEnd) {
+			requestStateSave();
 			advanceTrack();
 		}
 	}
@@ -453,6 +568,9 @@ void fail() {
 void setup() {
 	Serial.begin(9600);
 	Serial.println("MP3 player - BackgroundAudioMP3 example");
+	preferences.begin("vistream", false);
+	currentGain = constrain(preferences.getFloat("lastVolume", currentGain), 0.0f, 1.0f);
+	shuffleEnabled = preferences.getBool("shuffle", false);
 
 	Wire.begin(I2C_SDA, I2C_SCL);
 	u8g2.begin();
@@ -481,7 +599,26 @@ void setup() {
 	if (audioMutex == nullptr || stateMutex == nullptr || sdMutex == nullptr) fail();
 
 	currentDirectory = "/";
-	refreshBrowser();
+	String savedFolder = preferences.getString("lastFolder", "");
+	uint16_t savedTrack = preferences.getUShort("lastTrackIndex", 0);
+	uint32_t savedPosition = preferences.getUInt("lastPositionSec", 0);
+	bool restored = false;
+	if (savedFolder.length() > 0) {
+		restored = loadPlaylistFromDirectory(savedFolder, savedTrack);
+		if (restored) restorePosition(savedPosition);
+	}
+	if (restored) {
+		currentScreen = SCREEN_NOWPLAYING;
+		displayDirty = true;
+	} else if (loadPlaylistFromDirectory("/muzyka", 0)) {
+		currentScreen = SCREEN_NOWPLAYING;
+		displayDirty = true;
+	} else {
+		currentDirectory = "/";
+		refreshBrowser();
+		currentScreen = SCREEN_BROWSER;
+		displayDirty = true;
+	}
 
 	xTaskCreatePinnedToCore(
 			audioFeedTask,
@@ -575,6 +712,14 @@ void loop() {
 		displayedTrack = trackToDisplay;
 		displayedPaused = pausedToDisplay;
 		displayDirty = false;
+	}
+
+	if (currentScreen == SCREEN_NOWPLAYING) {
+		updatePlaybackPosition();
+	}
+	if (stateSaveRequested ||
+		(currentScreen == SCREEN_NOWPLAYING && now - lastStateSaveMillis >= STATE_SAVE_INTERVAL_MS)) {
+		saveStateToNvs();
 	}
 
 	delay(10);
