@@ -64,6 +64,8 @@ BackgroundAudioMP3 mp3(audio);
 U8G2_SSD1306_128X64_NONAME_F_HW_I2C u8g2(U8G2_R0, U8X8_PIN_NONE);
 
 File f;
+File uploadFile;
+String uploadTargetPath;
 uint8_t filebuff[512];
 std::vector<String> tracks;
 size_t currentTrack = 0;
@@ -120,6 +122,8 @@ volatile uint32_t screenTransitionStart = 0;
 Screen previousScreen = SCREEN_BROWSER;
 float batteryVoltage = 4.2f;
 uint32_t lastBatterySampleMillis = 0;
+String configuredSsid;
+String configuredPassword;
 
 bool isWifiClientConnected();
 void showVolumeOverlay();
@@ -380,6 +384,30 @@ bool loadPlaylistFromDirectory(const String &path, size_t selectedIndex) {
 	return opened;
 }
 
+bool playFileFromPath(const String &filePath) {
+	if (!filePath.startsWith("/") || filePath.endsWith("/")) return false;
+	String folder = parentPath(filePath);
+	String fileName = filePath.substring(filePath.lastIndexOf('/') + 1);
+	if (!scanDirectory(folder.c_str())) return false;
+
+	size_t selectedIndex = 0;
+	bool found = false;
+	for (const DirectoryEntry &entry : directoryEntries) {
+		if (!entry.isDirectory && !entry.isParent) {
+			if (entry.name == fileName) found = true;
+			if (!found) ++selectedIndex;
+		}
+	}
+	if (!found) return false;
+	bool opened = loadPlaylistFromDirectory(folder, selectedIndex);
+	if (opened) {
+		setScreen(SCREEN_NOWPLAYING);
+		displayDirty = true;
+		requestStateSave();
+	}
+	return opened;
+}
+
 void advanceTrack() {
 	xSemaphoreTake(stateMutex, portMAX_DELAY);
 	if (shuffleEnabled && !shuffleOrder.empty()) {
@@ -560,11 +588,15 @@ const char remotePage[] PROGMEM = R"HTML(
 body{font-family:sans-serif;max-width:480px;margin:24px auto;padding:0 16px;background:#111;color:#eee}
 button{font-size:18px;margin:4px;padding:10px 16px}input{width:100%}#title{font-size:20px;margin:20px 0 8px}
 .file{padding:8px 0;border-bottom:1px solid #333}.file a{float:right;color:#7cf}
+.file button{font-size:14px;padding:4px 8px}.file-name{display:inline-block;min-width:45%}
 </style></head><body><h1>vistream32</h1><div id="title">Loading...</div>
 <button onclick="post('/prev')">Prev</button><button id="playPauseButton" onclick="togglePlayPause()">Play</button><button onclick="post('/next')">Next</button>
 <p>Volume: <span id="vol">0</span>%</p><input id="volume" type="range" min="0" max="100" value="0" oninput="setVolume(this.value)">
 <p>Position: <span id="time">00:00 / 00:00</span></p><input id="seek" type="range" min="0" max="1" value="0" oninput="setSeek(this.value)">
 <h2>Files</h2><div><span id="filesPath">/</span></div><div id="files">Loading...</div>
+<form id="uploadForm"><input id="uploadFile" type="file" accept=".mp3,audio/mpeg"><button type="submit">Upload</button></form>
+<p><input id="newFolder" placeholder="Folder name"><button onclick="makeFolder()">New folder</button></p>
+<h2>Wi-Fi</h2><form id="configForm"><input id="ssid" placeholder="SSID"><input id="password" type="password" placeholder="Password"><button type="submit">Save & Restart</button></form>
 <script>
 let seekTimer;let isPaused=true;let filesPath='/';async function post(path){await fetch(path,{method:'POST'});refresh()}
 function togglePlayPause(){post(isPaused?'/play':'/pause')}
@@ -573,9 +605,14 @@ function setSeek(value){clearTimeout(seekTimer);seekTimer=setTimeout(()=>fetch('
 async function refresh(){let s=await (await fetch('/status')).json();isPaused=s.paused;document.querySelector('#playPauseButton').textContent=isPaused?'Play':'Pause';document.querySelector('#title').textContent=s.track;document.querySelector('#vol').textContent=s.volume;document.querySelector('#volume').value=s.volume;document.querySelector('#seek').max=s.duration;document.querySelector('#seek').value=s.position;document.querySelector('#time').textContent=s.positionText+' / '+s.durationText}
 function parentPath(path){if(path==='/')return '/';let i=path.lastIndexOf('/');return i<=0?'/':path.slice(0,i)}
 const listContainer=document.querySelector('#files');
-listContainer.addEventListener('click',(event)=>{const el=event.target.closest('[data-path]');if(!el)return;console.log('Kliknięto:',el.dataset.path,'isDir:',el.dataset.isDir);if(el.dataset.isDir==='1'){loadFiles(el.dataset.path)}else{window.location.href='/download?path='+encodeURIComponent(el.dataset.path)}});
-async function loadFiles(path){filesPath=path||'/';let entries=await (await fetch('/files?path='+encodeURIComponent(filesPath))).json();document.querySelector('#filesPath').textContent=filesPath;listContainer.replaceChildren();entries.forEach(e=>{const el=document.createElement('div');el.className='file';const full=e.name==='..'?parentPath(filesPath):(filesPath==='/'?'/'+e.name:filesPath+'/'+e.name);el.dataset.path=full;el.dataset.isDir=e.isDirectory?'1':'0';el.textContent=(e.isDirectory?'[D] ':'')+e.name;if(!e.isDirectory)el.textContent+=' ('+e.size+' B) Download';listContainer.appendChild(el)});if(!entries.length)listContainer.textContent='Empty'}
+async function loadFiles(path){filesPath=path||'/';let entries=await (await fetch('/files?path='+encodeURIComponent(filesPath))).json();document.querySelector('#filesPath').textContent=filesPath;listContainer.replaceChildren();entries.forEach(e=>{const full=e.name==='..'?parentPath(filesPath):(filesPath==='/'?'/'+e.name:filesPath+'/'+e.name);const el=document.createElement('div');el.className='file';el.dataset.path=full;el.dataset.isDir=e.isDirectory?'1':'0';const name=document.createElement('span');name.className='file-name';name.textContent=(e.isDirectory?'[D] ':'')+e.name;el.appendChild(name);if(!e.isDirectory){for(const action of ['play','download','delete']){const button=document.createElement('button');button.dataset.action=action;button.dataset.path=full;button.dataset.name=e.name;button.textContent=action[0].toUpperCase()+action.slice(1);el.appendChild(button)}}listContainer.appendChild(el)});if(!entries.length)listContainer.textContent='Empty'}
+listContainer.addEventListener('click',async(event)=>{const action=event.target.dataset.action;const path=event.target.dataset.path;if(action){if(action==='play')await post('/playFile?path='+encodeURIComponent(path));if(action==='download')window.location.href='/download?path='+encodeURIComponent(path);if(action==='delete'&&confirm('Na pewno usunąć '+event.target.dataset.name+'?')){await post('/delete?path='+encodeURIComponent(path));loadFiles(filesPath)}return}const el=event.target.closest('[data-path]');if(el&&el.dataset.isDir==='1'){console.log('Kliknięto:',el.dataset.path,'isDir:',el.dataset.isDir);loadFiles(el.dataset.path)}});
+document.querySelector('#uploadForm').addEventListener('submit',async(event)=>{event.preventDefault();const file=document.querySelector('#uploadFile').files[0];if(!file)return;const form=new FormData();form.append('path',filesPath);form.append('file',file);await fetch('/upload?path='+encodeURIComponent(filesPath),{method:'POST',body:form});loadFiles(filesPath)});
+async function makeFolder(){const name=document.querySelector('#newFolder').value.trim();if(name)await post('/mkdir?path='+encodeURIComponent((filesPath==='/'?'':filesPath)+'/'+name));loadFiles(filesPath)}
+async function loadConfig(){const c=await (await fetch('/config')).json();document.querySelector('#ssid').value=c.ssid;}
+document.querySelector('#configForm').addEventListener('submit',async(event)=>{event.preventDefault();await fetch('/config',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:'ssid='+encodeURIComponent(document.querySelector('#ssid').value)+'&password='+encodeURIComponent(document.querySelector('#password').value)});alert('Restarting AP');});
 refresh();loadFiles('/');setInterval(refresh,1500);
+loadConfig();
 </script></body></html>
 )HTML";
 
@@ -651,6 +688,92 @@ void webPrev() {
 	retreatTrack();
 	setScreen(SCREEN_NOWPLAYING);
 	webServer.send(200, "text/plain", "OK");
+}
+
+void webPlayFile() {
+	String path = webServer.hasArg("path") ? webServer.arg("path") : "";
+	bool played = path.startsWith("/") && path.indexOf("..") < 0 && playFileFromPath(path);
+	webServer.send(played ? 200 : 404, "text/plain", played ? "OK" : "File not found");
+}
+
+void webDelete() {
+	String path = webServer.hasArg("path") ? webServer.arg("path") : "";
+	if (!path.startsWith("/") || path.indexOf("..") >= 0) {
+		webServer.send(400, "text/plain", "Invalid path");
+		return;
+	}
+
+	String activePath;
+	xSemaphoreTake(stateMutex, portMAX_DELAY);
+	if (!tracks.empty() && currentTrack < tracks.size()) activePath = tracks[currentTrack];
+	xSemaphoreGive(stateMutex);
+	if (path == activePath) stopPlayback();
+
+	xSemaphoreTake(sdMutex, portMAX_DELAY);
+	bool removed = SD.remove(path.c_str());
+	xSemaphoreGive(sdMutex);
+	webServer.send(removed ? 200 : 404, "text/plain", removed ? "OK" : "File not found");
+}
+
+void webMkdir() {
+	String path = webServer.hasArg("path") ? webServer.arg("path") : "";
+	if (!path.startsWith("/") || path.indexOf("..") >= 0 || path == "/") {
+		webServer.send(400, "text/plain", "Invalid path");
+		return;
+	}
+	xSemaphoreTake(sdMutex, portMAX_DELAY);
+	bool created = SD.mkdir(path.c_str());
+	xSemaphoreGive(sdMutex);
+	webServer.send(created ? 200 : 409, "text/plain", created ? "OK" : "Unable to create folder");
+}
+
+void handleUpload(HTTPUpload &upload) {
+	if (upload.status == UPLOAD_FILE_START) {
+		String folder = webServer.hasArg("path") ? webServer.arg("path") : "/";
+		String name = upload.filename;
+		int separator = name.lastIndexOf('/');
+		if (separator >= 0) name = name.substring(separator + 1);
+		if (!folder.startsWith("/") || folder.indexOf("..") >= 0 || name.length() == 0 || name.indexOf("..") >= 0) return;
+		uploadTargetPath = joinPath(folder, name);
+		xSemaphoreTake(sdMutex, portMAX_DELAY);
+		SD.remove(uploadTargetPath.c_str());
+		uploadFile = SD.open(uploadTargetPath.c_str(), FILE_WRITE);
+		xSemaphoreGive(sdMutex);
+	} else if (upload.status == UPLOAD_FILE_WRITE && uploadFile) {
+		xSemaphoreTake(sdMutex, portMAX_DELAY);
+		uploadFile.write(upload.buf, upload.currentSize);
+		xSemaphoreGive(sdMutex);
+	} else if (upload.status == UPLOAD_FILE_END && uploadFile) {
+		xSemaphoreTake(sdMutex, portMAX_DELAY);
+		uploadFile.close();
+		xSemaphoreGive(sdMutex);
+	}
+}
+
+void handleUploadRequest() {
+	handleUpload(webServer.upload());
+}
+
+void uploadComplete() {
+	webServer.send(200, "text/plain", "OK");
+}
+
+void webConfigGet() {
+	webServer.send(200, "application/json", "{\"ssid\":\"" + jsonEscape(configuredSsid) + "\"}");
+}
+
+void webConfigPost() {
+	String ssid = webServer.arg("ssid");
+	String password = webServer.arg("password");
+	if (ssid.length() == 0 || password.length() < 8) {
+		webServer.send(400, "text/plain", "SSID and password are invalid");
+		return;
+	}
+	preferences.putString("wifiSsid", ssid);
+	preferences.putString("wifiPassword", password);
+	webServer.send(200, "text/plain", "Restarting");
+	delay(100);
+	ESP.restart();
 }
 
 void webVolume() {
@@ -734,7 +857,7 @@ void webDownload() {
 
 void setupWebServer() {
 	WiFi.mode(WIFI_AP);
-	WiFi.softAP(WIFI_AP_SSID, WIFI_AP_PASSWORD);
+	WiFi.softAP(configuredSsid.c_str(), configuredPassword.c_str());
 	Serial.print("Wi-Fi AP: ");
 	Serial.println(WIFI_AP_SSID);
 	Serial.print("AP IP: ");
@@ -745,10 +868,16 @@ void setupWebServer() {
 	webServer.on("/pause", HTTP_POST, webPause);
 	webServer.on("/next", HTTP_POST, webNext);
 	webServer.on("/prev", HTTP_POST, webPrev);
+	webServer.on("/playFile", HTTP_POST, webPlayFile);
+	webServer.on("/delete", HTTP_POST, webDelete);
+	webServer.on("/mkdir", HTTP_POST, webMkdir);
 	webServer.on("/volume", HTTP_POST, webVolume);
 	webServer.on("/seek", HTTP_POST, webSeek);
 	webServer.on("/files", HTTP_GET, webFiles);
 	webServer.on("/download", HTTP_GET, webDownload);
+	webServer.on("/upload", HTTP_POST, uploadComplete, handleUploadRequest);
+	webServer.on("/config", HTTP_GET, webConfigGet);
+	webServer.on("/config", HTTP_POST, webConfigPost);
 	webServer.begin();
 }
 
@@ -821,30 +950,7 @@ void selectBrowserEntry() {
 		return;
 	}
 
-	std::vector<String> playlist;
-	size_t selectedTrack = 0;
-	for (const DirectoryEntry &entry : directoryEntries) {
-		if (!entry.isDirectory && !entry.isParent) {
-			if (entry.name == selected.name) selectedTrack = playlist.size();
-			playlist.push_back(joinPath(currentDirectory, entry.name));
-		}
-	}
-	if (playlist.empty()) return;
-
-	xSemaphoreTake(stateMutex, portMAX_DELAY);
-	tracks = playlist;
-	currentTrack = selectedTrack;
-	if (openTrack(currentTrack)) {
-		xSemaphoreTake(audioMutex, portMAX_DELAY);
-		playbackStopped = false;
-		playbackPaused = false;
-		mp3.unpause();
-		xSemaphoreGive(audioMutex);
-		setScreen(SCREEN_NOWPLAYING);
-		requestStateSave();
-		displayDirty = true;
-	}
-	xSemaphoreGive(stateMutex);
+	playFileFromPath(joinPath(currentDirectory, selected.name));
 }
 
 void audioFeedTask(void *parameter) {
@@ -1074,6 +1180,8 @@ void setup() {
 	Serial.begin(9600);
 	Serial.println("MP3 player - BackgroundAudioMP3 example");
 	preferences.begin("vistream", false);
+	configuredSsid = preferences.isKey("wifiSsid") ? preferences.getString("wifiSsid") : WIFI_AP_SSID;
+	configuredPassword = preferences.isKey("wifiPassword") ? preferences.getString("wifiPassword") : WIFI_AP_PASSWORD;
 	currentGain = constrain(preferences.getFloat("lastVolume", currentGain), 0.0f, MAX_GAIN);
 	shuffleEnabled = preferences.getBool("shuffle", false);
 	uint8_t storedRepeatMode = preferences.getUChar("repeatMode", REPEAT_OFF);

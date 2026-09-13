@@ -121,7 +121,6 @@ Zasada ogólna: UI ma być rysowane jako **maszyna stanów ekranów** (`SCREEN_S
 - [ ] Download plików z urządzenia
 - [ ] Tworzenie folderów przez WWW
 - [ ] Usuwanie plików i folderów
-- [ ] Rename plików/folderów
 - [ ] Przełącznik Wi-Fi (uśpienie modułu dla oszczędności baterii)
 - [ ] Panel konfiguracji: zmiana SSID i hasła AP
 
