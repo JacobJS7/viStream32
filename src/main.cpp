@@ -19,7 +19,19 @@
 #define PREV_BUTTON_PIN 33
 #define PLAY_BUTTON_PIN 32
 #define LONG_PRESS_MS 800
+#define BROWSER_RETURN_MS 1500
 #define SEEK_BYTES_10_SECONDS 160000UL
+
+enum Screen : uint8_t {
+	SCREEN_BROWSER,
+	SCREEN_NOWPLAYING
+};
+
+struct DirectoryEntry {
+	String name;
+	bool isDirectory;
+	bool isParent;
+};
 
 ESP32I2SAudio audio(I2S_BCLK, I2S_LRC, I2S_DOUT);
 BackgroundAudioMP3 mp3(audio);
@@ -29,6 +41,12 @@ File f;
 uint8_t filebuff[512];
 std::vector<String> tracks;
 size_t currentTrack = 0;
+std::vector<DirectoryEntry> directoryEntries;
+String currentDirectory = "/";
+size_t browserSelection = 0;
+size_t browserOffset = 0;
+Screen currentScreen = SCREEN_BROWSER;
+bool displayDirty = true;
 
 volatile bool nextPressed = false;
 volatile bool prevPressed = false;
@@ -42,6 +60,7 @@ volatile uint32_t playPressMillis = 0;
 unsigned long lastButtonMillis = 0;
 SemaphoreHandle_t audioMutex;
 SemaphoreHandle_t stateMutex;
+SemaphoreHandle_t sdMutex;
 TaskHandle_t audioTaskHandle = nullptr;
 size_t displayedTrack = static_cast<size_t>(-1);
 bool displayedPaused = false;
@@ -78,28 +97,49 @@ void IRAM_ATTR handlePlayISR() {
 	}
 }
 
-void scanMusicDir() {
-	tracks.clear();
-	File dir = SD.open("/muzyka");
-	if (!dir) {
-		Serial.println("Brak folderu /muzyka");
-		return;
+String joinPath(const String &base, const String &name) {
+	if (base == "/") return "/" + name;
+	return base + "/" + name;
+}
+
+String parentPath(const String &path) {
+	if (path == "/") return "/";
+	int separator = path.lastIndexOf('/');
+	if (separator <= 0) return "/";
+	return path.substring(0, separator);
+}
+
+bool scanDirectory(const char *path) {
+	std::vector<DirectoryEntry> scannedEntries;
+	File dir;
+
+	xSemaphoreTake(sdMutex, portMAX_DELAY);
+	dir = SD.open(path);
+	if (!dir || !dir.isDirectory()) {
+		xSemaphoreGive(sdMutex);
+		return false;
+	}
+
+	if (String(path) != "/") {
+		scannedEntries.push_back({"..", true, true});
 	}
 
 	File entry = dir.openNextFile();
 	while (entry) {
-		if (!entry.isDirectory()) {
-			String name = entry.name();
-			if (name.endsWith(".mp3") || name.endsWith(".MP3")) {
-				tracks.push_back(String("/muzyka/") + name);
-			}
+		String name = entry.name();
+		int separator = name.lastIndexOf('/');
+		if (separator >= 0) name = name.substring(separator + 1);
+		if (entry.isDirectory() || name.endsWith(".mp3") || name.endsWith(".MP3")) {
+			scannedEntries.push_back({name, entry.isDirectory(), false});
 		}
 		entry.close();
 		entry = dir.openNextFile();
 	}
 	dir.close();
-	Serial.print("Znaleziono utworów: ");
-	Serial.println((int)tracks.size());
+	xSemaphoreGive(sdMutex);
+
+	directoryEntries = scannedEntries;
+	return true;
 }
 
 bool openTrack(size_t idx) {
@@ -107,12 +147,14 @@ bool openTrack(size_t idx) {
 	if (idx >= tracks.size()) idx = 0;
 
 	xSemaphoreTake(audioMutex, portMAX_DELAY);
+	xSemaphoreTake(sdMutex, portMAX_DELAY);
 	if (f) f.close();
 	Serial.print("Otwieram: ");
 	Serial.println(tracks[idx]);
 	f = SD.open(tracks[idx].c_str());
 	bool opened = f;
 	if (opened) mp3.flush();
+	xSemaphoreGive(sdMutex);
 	xSemaphoreGive(audioMutex);
 
 	if (!opened) {
@@ -136,7 +178,9 @@ void advanceTrack() {
 
 void closeTrack() {
 	xSemaphoreTake(audioMutex, portMAX_DELAY);
+	xSemaphoreTake(sdMutex, portMAX_DELAY);
 	if (f) f.close();
+	xSemaphoreGive(sdMutex);
 	xSemaphoreGive(audioMutex);
 }
 
@@ -176,9 +220,11 @@ void togglePlayPause() {
 
 void stopPlayback() {
 	xSemaphoreTake(audioMutex, portMAX_DELAY);
+	xSemaphoreTake(sdMutex, portMAX_DELAY);
 	if (f) {
 		f.close();
 	}
+	xSemaphoreGive(sdMutex);
 	mp3.flush();
 	mp3.pause();
 	playbackStopped = true;
@@ -188,6 +234,7 @@ void stopPlayback() {
 
 void seekByBytes(int32_t delta) {
 	xSemaphoreTake(audioMutex, portMAX_DELAY);
+	xSemaphoreTake(sdMutex, portMAX_DELAY);
 	if (f && !playbackStopped) {
 		uint32_t position = f.position();
 		uint32_t fileSize = f.size();
@@ -199,6 +246,7 @@ void seekByBytes(int32_t delta) {
 			Serial.println(delta > 0 ? "Fast forward 10 s" : "Rewind 10 s");
 		}
 	}
+	xSemaphoreGive(sdMutex);
 	xSemaphoreGive(audioMutex);
 }
 
@@ -230,6 +278,91 @@ void toggleMute() {
 	xSemaphoreGive(audioMutex);
 }
 
+void refreshBrowser() {
+	if (!scanDirectory(currentDirectory.c_str())) {
+		Serial.print("Nie można otworzyć katalogu: ");
+		Serial.println(currentDirectory);
+		currentDirectory = parentPath(currentDirectory);
+		scanDirectory(currentDirectory.c_str());
+	}
+	if (directoryEntries.empty()) {
+		browserSelection = 0;
+		browserOffset = 0;
+		return;
+	}
+	if (browserSelection >= directoryEntries.size()) {
+		browserSelection = directoryEntries.size() - 1;
+	}
+	if (browserSelection < browserOffset) browserOffset = browserSelection;
+	if (browserSelection >= browserOffset + 4) browserOffset = browserSelection - 3;
+}
+
+void enterBrowser() {
+	currentScreen = SCREEN_BROWSER;
+	refreshBrowser();
+	displayedTrack = static_cast<size_t>(-1);
+	displayDirty = true;
+}
+
+void moveBrowserSelection(int direction) {
+	if (directoryEntries.empty()) return;
+	if (direction > 0) {
+		browserSelection = (browserSelection + 1) % directoryEntries.size();
+	} else {
+		browserSelection = browserSelection == 0 ? directoryEntries.size() - 1 : browserSelection - 1;
+	}
+	if (browserSelection < browserOffset) browserOffset = browserSelection;
+	if (browserSelection >= browserOffset + 4) browserOffset = browserSelection - 3;
+	displayDirty = true;
+}
+
+void selectBrowserEntry() {
+	if (directoryEntries.empty()) return;
+	DirectoryEntry selected = directoryEntries[browserSelection];
+	if (selected.isParent) {
+		currentDirectory = parentPath(currentDirectory);
+		browserSelection = 0;
+		browserOffset = 0;
+		refreshBrowser();
+		displayDirty = true;
+		return;
+	}
+
+	String selectedPath = joinPath(currentDirectory, selected.name);
+	if (selected.isDirectory) {
+		currentDirectory = selectedPath;
+		browserSelection = 0;
+		browserOffset = 0;
+		refreshBrowser();
+		displayDirty = true;
+		return;
+	}
+
+	std::vector<String> playlist;
+	size_t selectedTrack = 0;
+	for (const DirectoryEntry &entry : directoryEntries) {
+		if (!entry.isDirectory && !entry.isParent) {
+			if (entry.name == selected.name) selectedTrack = playlist.size();
+			playlist.push_back(joinPath(currentDirectory, entry.name));
+		}
+	}
+	if (playlist.empty()) return;
+
+	xSemaphoreTake(stateMutex, portMAX_DELAY);
+	tracks = playlist;
+	currentTrack = selectedTrack;
+	if (openTrack(currentTrack)) {
+		xSemaphoreTake(audioMutex, portMAX_DELAY);
+		playbackStopped = false;
+		playbackPaused = false;
+		mp3.unpause();
+		xSemaphoreGive(audioMutex);
+		currentScreen = SCREEN_NOWPLAYING;
+		displayDirty = true;
+	}
+	xSemaphoreGive(stateMutex);
+}
+
 void audioFeedTask(void *parameter) {
 	(void)parameter;
 	for (;;) {
@@ -237,6 +370,7 @@ void audioFeedTask(void *parameter) {
 		bool reachedEnd = false;
 
 		xSemaphoreTake(audioMutex, portMAX_DELAY);
+		xSemaphoreTake(sdMutex, portMAX_DELAY);
 		while (f && !playbackPaused && !playbackStopped && mp3.availableForWrite() > 512) {
 			int len = f.read(filebuff, sizeof(filebuff));
 			if (len > 0) {
@@ -250,6 +384,7 @@ void audioFeedTask(void *parameter) {
 				break;
 			}
 		}
+		xSemaphoreGive(sdMutex);
 		xSemaphoreGive(audioMutex);
 
 		if (!fedData) vTaskDelay(pdMS_TO_TICKS(10));
@@ -281,6 +416,33 @@ void drawNowPlaying() {
 	u8g2.sendBuffer();
 }
 
+void drawBrowser() {
+	u8g2.clearBuffer();
+	u8g2.setFont(u8g2_font_6x10_tf);
+	String header = currentDirectory;
+	if (header.length() > 20) header = header.substring(header.length() - 20);
+	u8g2.drawStr(0, 9, header.c_str());
+	u8g2.drawHLine(0, 11, 128);
+
+	for (size_t row = 0; row < 4; ++row) {
+		size_t index = browserOffset + row;
+		if (index >= directoryEntries.size()) break;
+		int baseline = 21 + static_cast<int>(row) * 11;
+		if (index == browserSelection) {
+			u8g2.setDrawColor(1);
+			u8g2.drawBox(0, baseline - 9, 128, 11);
+			u8g2.setDrawColor(0);
+		}
+
+		DirectoryEntry entry = directoryEntries[index];
+		String label = entry.isParent ? ".." : (entry.isDirectory ? "[D] " : "    ") + entry.name;
+		if (label.length() > 20) label = label.substring(0, 20);
+		u8g2.drawStr(0, baseline, label.c_str());
+		u8g2.setDrawColor(1);
+	}
+	u8g2.sendBuffer();
+}
+
 void fail() {
 	while (true) {
 		delay(1000);
@@ -306,12 +468,7 @@ void setup() {
 	Serial.println("Karta SD OK");
 
 	audio.setPins(I2S_BCLK, I2S_LRC, I2S_DOUT);
-	mp3.setGain(0.05f);
-	scanMusicDir();
-	if (tracks.empty()) {
-		Serial.println("Brak utworów w /muzyka");
-		fail();
-	}
+	mp3.setGain(currentGain);
 
 	if (!mp3.begin()) {
 		Serial.println("Nie udało się uruchomić MP3 playera");
@@ -320,7 +477,11 @@ void setup() {
 
 	audioMutex = xSemaphoreCreateMutex();
 	stateMutex = xSemaphoreCreateMutex();
-	if (audioMutex == nullptr || stateMutex == nullptr || !openTrack(0)) fail();
+	sdMutex = xSemaphoreCreateMutex();
+	if (audioMutex == nullptr || stateMutex == nullptr || sdMutex == nullptr) fail();
+
+	currentDirectory = "/";
+	refreshBrowser();
 
 	xTaskCreatePinnedToCore(
 			audioFeedTask,
@@ -346,7 +507,9 @@ void loop() {
 		nextPressed = false;
 		if (now - lastButtonMillis > 300) {
 			lastButtonMillis = now;
-			if (now - nextPressMillis >= LONG_PRESS_MS) {
+			if (currentScreen == SCREEN_BROWSER) {
+				moveBrowserSelection(1);
+			} else if (now - nextPressMillis >= LONG_PRESS_MS) {
 				seekByBytes(SEEK_BYTES_10_SECONDS);
 			} else {
 				Serial.println("Przycisk NEXT: pomijanie utworu");
@@ -361,7 +524,12 @@ void loop() {
 		prevPressed = false;
 		if (now - lastButtonMillis > 300) {
 			lastButtonMillis = now;
-			if (now - prevPressMillis >= LONG_PRESS_MS) {
+			if (currentScreen == SCREEN_BROWSER) {
+				moveBrowserSelection(-1);
+			} else if (now - prevPressMillis >= BROWSER_RETURN_MS) {
+				Serial.println("Powrót do przeglądarki");
+				enterBrowser();
+			} else if (now - prevPressMillis >= LONG_PRESS_MS) {
 				seekByBytes(-static_cast<int32_t>(SEEK_BYTES_10_SECONDS));
 			} else {
 				Serial.println("Przycisk PREV: poprzedni utwór");
@@ -376,7 +544,9 @@ void loop() {
 		playPressed = false;
 		if (now - lastButtonMillis > 300) {
 			lastButtonMillis = now;
-			if (now - playPressMillis >= LONG_PRESS_MS) {
+			if (currentScreen == SCREEN_BROWSER) {
+				if (now - playPressMillis < LONG_PRESS_MS) selectBrowserEntry();
+			} else if (now - playPressMillis >= LONG_PRESS_MS) {
 				Serial.println("Długie PLAY: stop");
 				stopPlayback();
 			} else {
@@ -386,17 +556,25 @@ void loop() {
 	}
 
 	size_t trackToDisplay;
-	bool pausedToDisplay;
 	xSemaphoreTake(stateMutex, portMAX_DELAY);
 	trackToDisplay = currentTrack;
 	xSemaphoreGive(stateMutex);
 	xSemaphoreTake(audioMutex, portMAX_DELAY);
-	pausedToDisplay = playbackPaused || playbackStopped;
+	bool pausedToDisplay = playbackPaused || playbackStopped;
 	xSemaphoreGive(audioMutex);
-	if (trackToDisplay != displayedTrack || pausedToDisplay != displayedPaused) {
-		drawNowPlaying();
+	if (currentScreen == SCREEN_NOWPLAYING &&
+		(trackToDisplay != displayedTrack || pausedToDisplay != displayedPaused)) {
+		displayDirty = true;
+	}
+	if (displayDirty) {
+		if (currentScreen == SCREEN_BROWSER) {
+			drawBrowser();
+		} else {
+			drawNowPlaying();
+		}
 		displayedTrack = trackToDisplay;
 		displayedPaused = pausedToDisplay;
+		displayDirty = false;
 	}
 
 	delay(10);
