@@ -33,6 +33,12 @@
 #define MAX_GAIN 0.05f
 #define GAIN_STEP 0.0025f
 
+enum RepeatMode : uint8_t {
+	REPEAT_OFF,
+	REPEAT_ONE,
+	REPEAT_ALL
+};
+
 enum Screen : uint8_t {
 	SCREEN_BROWSER,
 	SCREEN_NOWPLAYING
@@ -52,6 +58,9 @@ File f;
 uint8_t filebuff[512];
 std::vector<String> tracks;
 size_t currentTrack = 0;
+std::vector<size_t> shuffleOrder;
+size_t shuffleCursor = 0;
+RepeatMode repeatMode = REPEAT_OFF;
 std::vector<DirectoryEntry> directoryEntries;
 String currentDirectory = "/";
 size_t browserSelection = 0;
@@ -68,8 +77,8 @@ volatile bool playReleased = false;
 volatile uint32_t nextPressMillis = 0;
 volatile uint32_t prevPressMillis = 0;
 volatile uint32_t playPressMillis = 0;
-bool muteComboTriggered = false;
-uint32_t muteComboStartedAt = 0;
+uint32_t browserComboStartedAt = 0;
+bool browserComboTriggered = false;
 bool playModifierUsed = false;
 bool playClickPending = false;
 uint32_t lastPlayReleaseMillis = 0;
@@ -84,8 +93,6 @@ bool displayedPaused = false;
 volatile bool playbackPaused = false;
 volatile bool playbackStopped = false;
 float currentGain = DEFAULT_GAIN;
-float gainBeforeMute = DEFAULT_GAIN;
-bool muted = false;
 Preferences preferences;
 bool shuffleEnabled = false;
 volatile uint32_t currentPositionSec = 0;
@@ -210,12 +217,14 @@ void saveStateToNvs() {
 	uint32_t position;
 	float gain;
 	bool shuffle;
+	uint8_t savedRepeatMode;
 
 	xSemaphoreTake(stateMutex, portMAX_DELAY);
 	folder = currentDirectory;
 	trackIndex = static_cast<uint16_t>(currentTrack);
 	position = currentPositionSec;
 	shuffle = shuffleEnabled;
+	savedRepeatMode = static_cast<uint8_t>(repeatMode);
 	xSemaphoreGive(stateMutex);
 	xSemaphoreTake(audioMutex, portMAX_DELAY);
 	gain = currentGain;
@@ -226,8 +235,52 @@ void saveStateToNvs() {
 	preferences.putUInt("lastPositionSec", position);
 	preferences.putFloat("lastVolume", gain);
 	preferences.putBool("shuffle", shuffle);
+	preferences.putUChar("repeatMode", savedRepeatMode);
 	stateSaveRequested = false;
 	lastStateSaveMillis = millis();
+}
+
+void rebuildShuffleOrder(size_t firstTrack) {
+	shuffleOrder.clear();
+	for (size_t index = 0; index < tracks.size(); ++index) shuffleOrder.push_back(index);
+	for (size_t index = shuffleOrder.size(); index > 1; --index) {
+		size_t other = random(index);
+		size_t swapIndex = index - 1;
+		size_t value = shuffleOrder[swapIndex];
+		shuffleOrder[swapIndex] = shuffleOrder[other];
+		shuffleOrder[other] = value;
+	}
+	if (!shuffleOrder.empty()) {
+		for (size_t index = 0; index < shuffleOrder.size(); ++index) {
+			if (shuffleOrder[index] == firstTrack) {
+				size_t value = shuffleOrder[0];
+				shuffleOrder[0] = shuffleOrder[index];
+				shuffleOrder[index] = value;
+				break;
+			}
+		}
+		shuffleCursor = 0;
+	}
+}
+
+void cyclePlaybackMode() {
+	if (repeatMode == REPEAT_OFF && !shuffleEnabled) {
+		shuffleEnabled = true;
+		repeatMode = REPEAT_OFF;
+		rebuildShuffleOrder(currentTrack);
+		Serial.println("Tryb: SHUFFLE");
+	} else if (shuffleEnabled) {
+		shuffleEnabled = false;
+		repeatMode = REPEAT_ONE;
+		Serial.println("Tryb: REPEAT ONE");
+	} else if (repeatMode == REPEAT_ONE) {
+		repeatMode = REPEAT_ALL;
+		Serial.println("Tryb: REPEAT ALL");
+	} else {
+		repeatMode = REPEAT_OFF;
+		Serial.println("Tryb: NORMAL");
+	}
+	requestStateSave();
 }
 
 void restorePosition(uint32_t positionSec) {
@@ -291,6 +344,7 @@ bool loadPlaylistFromDirectory(const String &path, size_t selectedIndex) {
 	currentDirectory = path;
 	tracks = playlist;
 	currentTrack = selectedIndex;
+	if (shuffleEnabled) rebuildShuffleOrder(currentTrack);
 	bool opened = openTrack(currentTrack);
 	if (opened) {
 		xSemaphoreTake(audioMutex, portMAX_DELAY);
@@ -305,7 +359,12 @@ bool loadPlaylistFromDirectory(const String &path, size_t selectedIndex) {
 
 void advanceTrack() {
 	xSemaphoreTake(stateMutex, portMAX_DELAY);
-	currentTrack = (currentTrack + 1) % tracks.size();
+	if (shuffleEnabled && !shuffleOrder.empty()) {
+		shuffleCursor = (shuffleCursor + 1) % shuffleOrder.size();
+		currentTrack = shuffleOrder[shuffleCursor];
+	} else {
+		currentTrack = (currentTrack + 1) % tracks.size();
+	}
 	openTrack(currentTrack);
 	xSemaphoreTake(audioMutex, portMAX_DELAY);
 	playbackStopped = false;
@@ -314,6 +373,44 @@ void advanceTrack() {
 	xSemaphoreGive(audioMutex);
 	xSemaphoreGive(stateMutex);
 	requestStateSave();
+}
+
+void stopAtEnd() {
+	xSemaphoreTake(audioMutex, portMAX_DELAY);
+	mp3.flush();
+	mp3.pause();
+	playbackStopped = true;
+	playbackPaused = true;
+	xSemaphoreGive(audioMutex);
+	requestStateSave();
+}
+
+void handleTrackEnd() {
+	if (repeatMode == REPEAT_ONE) {
+		openTrack(currentTrack);
+		return;
+	}
+
+	if (shuffleEnabled && !shuffleOrder.empty()) {
+		if (shuffleCursor + 1 < shuffleOrder.size()) {
+			advanceTrack();
+		} else if (repeatMode == REPEAT_ALL) {
+			rebuildShuffleOrder(currentTrack);
+			advanceTrack();
+		} else {
+			stopAtEnd();
+		}
+		return;
+	}
+
+	if (currentTrack + 1 < tracks.size()) {
+		advanceTrack();
+	} else if (repeatMode == REPEAT_ALL) {
+		currentTrack = static_cast<size_t>(-1);
+		advanceTrack();
+	} else {
+		stopAtEnd();
+	}
 }
 
 void closeTrack() {
@@ -326,7 +423,12 @@ void closeTrack() {
 
 void retreatTrack() {
 	xSemaphoreTake(stateMutex, portMAX_DELAY);
-	currentTrack = currentTrack == 0 ? tracks.size() - 1 : currentTrack - 1;
+	if (shuffleEnabled && !shuffleOrder.empty()) {
+		shuffleCursor = shuffleCursor == 0 ? shuffleOrder.size() - 1 : shuffleCursor - 1;
+		currentTrack = shuffleOrder[shuffleCursor];
+	} else {
+		currentTrack = currentTrack == 0 ? tracks.size() - 1 : currentTrack - 1;
+	}
 	openTrack(currentTrack);
 	xSemaphoreTake(audioMutex, portMAX_DELAY);
 	playbackStopped = false;
@@ -401,7 +503,7 @@ void seekByBytes(int32_t delta) {
 void volumeUp() {
 	xSemaphoreTake(audioMutex, portMAX_DELAY);
 	currentGain = min(currentGain + GAIN_STEP, MAX_GAIN);
-	if (!muted) mp3.setGain(currentGain);
+	mp3.setGain(currentGain);
 	xSemaphoreGive(audioMutex);
 	Serial.print("currentGain: ");
 	Serial.println(currentGain, 3);
@@ -412,25 +514,7 @@ void volumeUp() {
 void volumeDown() {
 	xSemaphoreTake(audioMutex, portMAX_DELAY);
 	currentGain = max(currentGain - GAIN_STEP, 0.0f);
-	if (!muted) mp3.setGain(currentGain);
-	xSemaphoreGive(audioMutex);
-	Serial.print("currentGain: ");
-	Serial.println(currentGain, 3);
-	requestStateSave();
-	showVolumeOverlay();
-}
-
-void toggleMute() {
-	xSemaphoreTake(audioMutex, portMAX_DELAY);
-	if (muted) {
-		currentGain = gainBeforeMute;
-		mp3.setGain(currentGain);
-		muted = false;
-	} else {
-		gainBeforeMute = currentGain;
-		mp3.setGain(0.0f);
-		muted = true;
-	}
+	mp3.setGain(currentGain);
 	xSemaphoreGive(audioMutex);
 	Serial.print("currentGain: ");
 	Serial.println(currentGain, 3);
@@ -562,7 +646,7 @@ void audioFeedTask(void *parameter) {
 
 		if (reachedEnd) {
 			requestStateSave();
-			advanceTrack();
+				handleTrackEnd();
 		}
 	}
 }
@@ -616,6 +700,13 @@ void drawNowPlaying() {
 	u8g2.clearBuffer();
 	u8g2.setFont(u8g2_font_6x10_tf);
 	u8g2.drawStr(0, 10, "Now Playing");
+	if (shuffleEnabled) {
+		u8g2.drawStr(102, 10, "S");
+	} else if (repeatMode == REPEAT_ONE) {
+		u8g2.drawStr(96, 10, "R1");
+	} else if (repeatMode == REPEAT_ALL) {
+		u8g2.drawStr(94, 10, "RA");
+	}
 	if (batteryVoltage < BATTERY_WARNING_VOLTAGE && ((now / 500) % 2 == 0)) {
 		u8g2.drawFrame(112, 2, 13, 7);
 		u8g2.drawBox(125, 4, 2, 3);
@@ -755,6 +846,8 @@ void setup() {
 	preferences.begin("vistream", false);
 	currentGain = constrain(preferences.getFloat("lastVolume", currentGain), 0.0f, MAX_GAIN);
 	shuffleEnabled = preferences.getBool("shuffle", false);
+	uint8_t storedRepeatMode = preferences.getUChar("repeatMode", REPEAT_OFF);
+	repeatMode = storedRepeatMode <= REPEAT_ALL ? static_cast<RepeatMode>(storedRepeatMode) : REPEAT_OFF;
 
 	Wire.begin(I2C_SDA, I2C_SCL);
 	u8g2.begin();
@@ -835,21 +928,21 @@ void loop() {
 	bool nextHeld = digitalRead(NEXT_BUTTON_PIN) == LOW;
 	bool prevHeld = digitalRead(PREV_BUTTON_PIN) == LOW;
 	if (nextHeld && prevHeld) {
-		if (muteComboStartedAt == 0) muteComboStartedAt = now;
-		if (!muteComboTriggered && now - muteComboStartedAt >= 500) {
+		if (browserComboStartedAt == 0) browserComboStartedAt = now;
+		if (!browserComboTriggered && now - browserComboStartedAt >= 500) {
 			Serial.println("Next+Prev: powrót do przeglądarki");
 			enterBrowser();
-			muteComboTriggered = true;
+			browserComboTriggered = true;
 		}
 	} else if (!nextHeld && !prevHeld) {
-		muteComboStartedAt = 0;
-		muteComboTriggered = false;
+		browserComboStartedAt = 0;
+		browserComboTriggered = false;
 	}
 
 	if (nextReleased && nextPressed) {
 		nextReleased = false;
 		nextPressed = false;
-		if (!muteComboTriggered && now - lastButtonMillis > 300) {
+		if (now - lastButtonMillis > 300) {
 			lastButtonMillis = now;
 			if (playPressed && now - nextPressMillis < LONG_PRESS_MS) {
 				volumeUp();
@@ -869,7 +962,7 @@ void loop() {
 	if (prevReleased && prevPressed) {
 		prevReleased = false;
 		prevPressed = false;
-		if (!muteComboTriggered && now - lastButtonMillis > 300) {
+		if (now - lastButtonMillis > 300) {
 			lastButtonMillis = now;
 			if (playPressed && now - prevPressMillis < LONG_PRESS_MS) {
 				volumeDown();
@@ -896,11 +989,16 @@ void loop() {
 			if (now - playPressMillis >= LONG_PRESS_MS) {
 				Serial.println("Długie PLAY: stop");
 				playClickPending = false;
-				stopPlayback();
+				if (currentScreen == SCREEN_BROWSER) {
+					setScreen(SCREEN_NOWPLAYING);
+					displayDirty = true;
+				} else {
+					stopPlayback();
+				}
 			} else if (playClickPending && now - lastPlayReleaseMillis <= PLAY_DOUBLE_CLICK_MS) {
-				Serial.println("Podwójny PLAY: mute/unmute");
+				Serial.println("Podwójny PLAY: zmiana trybu");
 				playClickPending = false;
-				toggleMute();
+				cyclePlaybackMode();
 			} else {
 				playClickPending = true;
 				lastPlayReleaseMillis = now;
