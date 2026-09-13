@@ -20,10 +20,15 @@
 #define PREV_BUTTON_PIN 33
 #define PLAY_BUTTON_PIN 32
 #define LONG_PRESS_MS 800
-#define BROWSER_RETURN_MS 1500
+#define PLAY_DOUBLE_CLICK_MS 400
 #define SEEK_BYTES_10_SECONDS 160000UL
 #define STATE_SAVE_INTERVAL_MS 12000UL
 #define APPROXIMATE_MP3_BYTES_PER_SECOND 16000UL
+#define UI_ANIMATIONS 1
+#define UI_FRAME_INTERVAL_MS 40UL
+#define UI_TRANSITION_MS 240UL
+#define UI_VOLUME_OVERLAY_MS 1500UL
+#define BATTERY_WARNING_VOLTAGE 3.4f
 
 enum Screen : uint8_t {
 	SCREEN_BROWSER,
@@ -49,7 +54,7 @@ String currentDirectory = "/";
 size_t browserSelection = 0;
 size_t browserOffset = 0;
 Screen currentScreen = SCREEN_BROWSER;
-bool displayDirty = true;
+volatile bool displayDirty = true;
 
 volatile bool nextPressed = false;
 volatile bool prevPressed = false;
@@ -60,11 +65,17 @@ volatile bool playReleased = false;
 volatile uint32_t nextPressMillis = 0;
 volatile uint32_t prevPressMillis = 0;
 volatile uint32_t playPressMillis = 0;
+bool muteComboTriggered = false;
+uint32_t muteComboStartedAt = 0;
+bool playModifierUsed = false;
+bool playClickPending = false;
+uint32_t lastPlayReleaseMillis = 0;
 unsigned long lastButtonMillis = 0;
 SemaphoreHandle_t audioMutex;
 SemaphoreHandle_t stateMutex;
 SemaphoreHandle_t sdMutex;
 TaskHandle_t audioTaskHandle = nullptr;
+TaskHandle_t uiTaskHandle = nullptr;
 size_t displayedTrack = static_cast<size_t>(-1);
 bool displayedPaused = false;
 volatile bool playbackPaused = false;
@@ -79,6 +90,17 @@ uint32_t trackPositionBaseSec = 0;
 uint32_t playbackReferenceMillis = 0;
 volatile bool stateSaveRequested = false;
 uint32_t lastStateSaveMillis = 0;
+volatile uint8_t splashProgress = 0;
+volatile bool uiReady = false;
+volatile uint32_t volumeOverlayUntil = 0;
+volatile uint32_t uiStateChangeMillis = 0;
+volatile uint32_t currentTrackDurationSec = 1;
+volatile uint32_t screenTransitionStart = 0;
+Screen previousScreen = SCREEN_BROWSER;
+float batteryVoltage = 4.2f;
+
+bool isWifiClientConnected();
+void showVolumeOverlay();
 
 void IRAM_ATTR handleNextISR() {
 	if (digitalRead(NEXT_BUTTON_PIN) == LOW) {
@@ -105,6 +127,15 @@ void IRAM_ATTR handlePlayISR() {
 	} else {
 		playReleased = true;
 	}
+}
+
+void setScreen(Screen nextScreen) {
+	if (currentScreen == nextScreen) return;
+	previousScreen = currentScreen;
+	currentScreen = nextScreen;
+	screenTransitionStart = millis();
+	uiStateChangeMillis = millis();
+	displayDirty = true;
 }
 
 String joinPath(const String &base, const String &name) {
@@ -232,6 +263,11 @@ bool openTrack(size_t idx) {
 		Serial.println("Nie można otworzyć pliku");
 		return false;
 	}
+	xSemaphoreTake(sdMutex, portMAX_DELAY);
+	uint32_t fileSize = f.size();
+	xSemaphoreGive(sdMutex);
+	// BackgroundAudioMP3 exposes no MP3 bitrate/header metadata; this is a deliberate estimate.
+	currentTrackDurationSec = max(1UL, fileSize / APPROXIMATE_MP3_BYTES_PER_SECOND);
 	resetPlaybackPosition();
 	return true;
 }
@@ -364,7 +400,10 @@ void volumeUp() {
 	currentGain = min(currentGain + 0.01f, 1.0f);
 	if (!muted) mp3.setGain(currentGain);
 	xSemaphoreGive(audioMutex);
+	Serial.print("currentGain: ");
+	Serial.println(currentGain, 3);
 	requestStateSave();
+	showVolumeOverlay();
 }
 
 void volumeDown() {
@@ -372,7 +411,10 @@ void volumeDown() {
 	currentGain = max(currentGain - 0.01f, 0.0f);
 	if (!muted) mp3.setGain(currentGain);
 	xSemaphoreGive(audioMutex);
+	Serial.print("currentGain: ");
+	Serial.println(currentGain, 3);
 	requestStateSave();
+	showVolumeOverlay();
 }
 
 void toggleMute() {
@@ -387,7 +429,19 @@ void toggleMute() {
 		muted = true;
 	}
 	xSemaphoreGive(audioMutex);
+	Serial.print("currentGain: ");
+	Serial.println(currentGain, 3);
 	requestStateSave();
+	showVolumeOverlay();
+}
+
+bool isWifiClientConnected() {
+	return false;
+}
+
+void showVolumeOverlay() {
+	volumeOverlayUntil = millis() + UI_VOLUME_OVERLAY_MS;
+	displayDirty = true;
 }
 
 void refreshBrowser() {
@@ -410,7 +464,7 @@ void refreshBrowser() {
 }
 
 void enterBrowser() {
-	currentScreen = SCREEN_BROWSER;
+	setScreen(SCREEN_BROWSER);
 	refreshBrowser();
 	displayedTrack = static_cast<size_t>(-1);
 	displayDirty = true;
@@ -469,7 +523,7 @@ void selectBrowserEntry() {
 		playbackPaused = false;
 		mp3.unpause();
 		xSemaphoreGive(audioMutex);
-		currentScreen = SCREEN_NOWPLAYING;
+		setScreen(SCREEN_NOWPLAYING);
 		requestStateSave();
 		displayDirty = true;
 	}
@@ -511,27 +565,116 @@ void audioFeedTask(void *parameter) {
 }
 
 void drawNowPlaying() {
+	uint32_t now = millis();
+	String title;
+	size_t trackIndex;
 	xSemaphoreTake(stateMutex, portMAX_DELAY);
-	String title = tracks.empty() ? String("Brak utworu") : tracks[currentTrack];
+	trackIndex = currentTrack;
+	title = tracks.empty() ? String("Brak utworu") : tracks[currentTrack];
 	xSemaphoreGive(stateMutex);
 	xSemaphoreTake(audioMutex, portMAX_DELAY);
 	bool paused = playbackPaused || playbackStopped;
 	xSemaphoreGive(audioMutex);
 	int separator = title.lastIndexOf('/');
 	if (separator >= 0) title = title.substring(separator + 1);
-	if (title.length() > 20) title = title.substring(0, 20);
+
+	static size_t marqueeTrack = static_cast<size_t>(-1);
+	static int marqueeOffset = 0;
+	static uint32_t marqueeChangedAt = 0;
+	if (trackIndex != marqueeTrack) {
+		marqueeTrack = trackIndex;
+		marqueeOffset = 0;
+		marqueeChangedAt = now;
+	}
+
+	uint32_t positionSec = currentPositionSec;
+	uint32_t durationSec = currentTrackDurationSec;
+	if (durationSec == 0) durationSec = 1;
+	uint32_t displayPosition = min(positionSec, durationSec);
+	float progress = min(1.0f, static_cast<float>(positionSec) / durationSec);
+	xSemaphoreTake(audioMutex, portMAX_DELAY);
+	float displayGain = currentGain;
+	xSemaphoreGive(audioMutex);
+	int titleWidth = u8g2.getUTF8Width(title.c_str());
+	int titleX = 0;
+	if (titleWidth > 128) {
+		if (UI_ANIMATIONS && now - marqueeChangedAt > 1200) {
+			uint32_t cycle = now - marqueeChangedAt - 1200;
+			if (cycle < static_cast<uint32_t>(titleWidth * 40 + 500)) {
+				marqueeOffset = min(titleWidth, static_cast<int>(cycle / 40));
+			} else {
+				marqueeChangedAt = now;
+				marqueeOffset = 0;
+			}
+		}
+		titleX = -marqueeOffset;
+	}
 
 	u8g2.clearBuffer();
 	u8g2.setFont(u8g2_font_6x10_tf);
 	u8g2.drawStr(0, 10, "Now Playing");
+	if (batteryVoltage < BATTERY_WARNING_VOLTAGE && ((now / 500) % 2 == 0)) {
+		u8g2.drawFrame(112, 2, 13, 7);
+		u8g2.drawBox(125, 4, 2, 3);
+	} else {
+		u8g2.drawFrame(112, 2, 13, 7);
+		u8g2.drawBox(125, 4, 2, 3);
+	}
 	u8g2.drawHLine(0, 13, 128);
-	u8g2.drawUTF8(0, 31, title.c_str());
-	u8g2.drawTriangle(8, 47, 8, 59, 18, 53);
-	u8g2.drawStr(25, 56, paused ? "PAUSE" : "PLAY");
+	if (titleWidth <= 128) {
+		u8g2.drawUTF8(0, 23, title.c_str());
+	} else {
+		u8g2.drawUTF8(titleX, 23, title.c_str());
+		if (marqueeOffset >= titleWidth) u8g2.drawUTF8(128, 23, title.c_str());
+	}
+	u8g2.drawFrame(0, 27, 128, 6);
+	u8g2.drawBox(1, 28, max(1, static_cast<int>(126 * progress)), 4);
+	char timeText[20];
+	snprintf(timeText, sizeof(timeText), "%02lu:%02lu / %02lu:%02lu",
+			displayPosition / 60, displayPosition % 60, durationSec / 60, durationSec % 60);
+	u8g2.drawStr(0, 42, timeText);
+
+	uint32_t iconElapsed = now - uiStateChangeMillis;
+	uint8_t iconSize = UI_ANIMATIONS ? min(8UL, 4UL + iconElapsed / 60) : 8;
+	if (paused) {
+		u8g2.drawBox(7, 48, 3, iconSize);
+		u8g2.drawBox(14, 48, 3, iconSize);
+	} else {
+		u8g2.drawTriangle(7, 48, 7, 48 + iconSize, 7 + iconSize, 48 + iconSize / 2);
+	}
+
+	if (!paused && UI_ANIMATIONS) {
+		for (uint8_t bar = 0; bar < 5; ++bar) {
+			uint8_t height = 4 + ((now / 140 + bar * 3) % 10);
+			u8g2.drawBox(42 + bar * 6, 60 - height, 4, height);
+		}
+	}
+	if (isWifiClientConnected()) {
+		u8g2.drawCircle(118, 57, 2);
+		u8g2.drawCircle(118, 57, 6);
+		u8g2.drawCircle(118, 57, 9);
+	}
+	if (static_cast<int32_t>(volumeOverlayUntil - now) > 0) {
+		char volumeText[16];
+		snprintf(volumeText, sizeof(volumeText), "Vol: %d%%", static_cast<int>(displayGain * 100));
+		u8g2.setDrawColor(0);
+		u8g2.drawBox(52, 44, 76, 18);
+		u8g2.setDrawColor(1);
+		u8g2.drawFrame(52, 44, 76, 18);
+		u8g2.drawStr(58, 56, volumeText);
+	}
 	u8g2.sendBuffer();
 }
 
 void drawBrowser() {
+	uint32_t now = millis();
+	static float highlightRow = 0.0f;
+	float targetRow = static_cast<float>(browserSelection - browserOffset);
+	if (!UI_ANIMATIONS) highlightRow = targetRow;
+	else highlightRow += (targetRow - highlightRow) * min(1.0f, (now % 1000) / 120.0f);
+	if (highlightRow < 0) highlightRow = 0;
+	if (highlightRow > 3) highlightRow = 3;
+
 	u8g2.clearBuffer();
 	u8g2.setFont(u8g2_font_6x10_tf);
 	String header = currentDirectory;
@@ -543,9 +686,9 @@ void drawBrowser() {
 		size_t index = browserOffset + row;
 		if (index >= directoryEntries.size()) break;
 		int baseline = 21 + static_cast<int>(row) * 11;
-		if (index == browserSelection) {
+		if (static_cast<int>(row) == static_cast<int>(highlightRow + 0.5f)) {
 			u8g2.setDrawColor(1);
-			u8g2.drawBox(0, baseline - 9, 128, 11);
+			u8g2.drawBox(0, 21 + static_cast<int>(highlightRow) * 11 - 9, 128, 11);
 			u8g2.setDrawColor(0);
 		}
 
@@ -556,6 +699,44 @@ void drawBrowser() {
 		u8g2.setDrawColor(1);
 	}
 	u8g2.sendBuffer();
+}
+
+void drawSplash(uint32_t now) {
+	u8g2.clearBuffer();
+	u8g2.setFont(u8g2_font_6x10_tf);
+	u8g2.drawStr(29, 22, "vistream32");
+	u8g2.drawFrame(14, 35, 100, 8);
+	uint8_t width = static_cast<uint8_t>(min(96UL, static_cast<uint32_t>(splashProgress) * 96 / 100));
+	if (UI_ANIMATIONS) width = max(width, static_cast<uint8_t>((now / 80) % 97));
+	u8g2.drawBox(16, 37, width, 4);
+	u8g2.sendBuffer();
+}
+
+void drawScreenTransition(uint32_t now) {
+	if (!UI_ANIMATIONS || screenTransitionStart == 0) return;
+	uint32_t elapsed = now - screenTransitionStart;
+	if (elapsed >= UI_TRANSITION_MS) return;
+	uint8_t remaining = static_cast<uint8_t>(128 - (elapsed * 128 / UI_TRANSITION_MS));
+	u8g2.setDrawColor(0);
+	u8g2.drawBox(0, 0, remaining, 64);
+	u8g2.setDrawColor(1);
+}
+
+void uiTask(void *parameter) {
+	(void)parameter;
+	for (;;) {
+		uint32_t now = millis();
+		if (!uiReady) {
+			drawSplash(now);
+		} else if (currentScreen == SCREEN_BROWSER) {
+			drawBrowser();
+			drawScreenTransition(now);
+		} else {
+			drawNowPlaying();
+			drawScreenTransition(now);
+		}
+		vTaskDelay(pdMS_TO_TICKS(UI_FRAME_INTERVAL_MS));
+	}
 }
 
 void fail() {
@@ -574,16 +755,22 @@ void setup() {
 
 	Wire.begin(I2C_SDA, I2C_SCL);
 	u8g2.begin();
-	u8g2.clearBuffer();
-	u8g2.setFont(u8g2_font_6x10_tf);
-	u8g2.drawStr(0, 20, "Starting...");
-	u8g2.sendBuffer();
+	splashProgress = 10;
+	xTaskCreatePinnedToCore(
+			uiTask,
+			"oled-ui",
+			4096,
+			nullptr,
+			1,
+			&uiTaskHandle,
+			0);
 
 	if (!SD.begin(SD_CS)) {
 		Serial.println("Błąd karty SD!");
 		fail();
 	}
 	Serial.println("Karta SD OK");
+	splashProgress = 40;
 
 	audio.setPins(I2S_BCLK, I2S_LRC, I2S_DOUT);
 	mp3.setGain(currentGain);
@@ -592,6 +779,7 @@ void setup() {
 		Serial.println("Nie udało się uruchomić MP3 playera");
 		fail();
 	}
+	splashProgress = 70;
 
 	audioMutex = xSemaphoreCreateMutex();
 	stateMutex = xSemaphoreCreateMutex();
@@ -608,17 +796,19 @@ void setup() {
 		if (restored) restorePosition(savedPosition);
 	}
 	if (restored) {
-		currentScreen = SCREEN_NOWPLAYING;
+		setScreen(SCREEN_NOWPLAYING);
 		displayDirty = true;
 	} else if (loadPlaylistFromDirectory("/muzyka", 0)) {
-		currentScreen = SCREEN_NOWPLAYING;
+		setScreen(SCREEN_NOWPLAYING);
 		displayDirty = true;
 	} else {
 		currentDirectory = "/";
 		refreshBrowser();
-		currentScreen = SCREEN_BROWSER;
+		setScreen(SCREEN_BROWSER);
 		displayDirty = true;
 	}
+	splashProgress = 100;
+	uiReady = true;
 
 	xTaskCreatePinnedToCore(
 			audioFeedTask,
@@ -639,12 +829,29 @@ void setup() {
 
 void loop() {
 	unsigned long now = millis();
+	bool nextHeld = digitalRead(NEXT_BUTTON_PIN) == LOW;
+	bool prevHeld = digitalRead(PREV_BUTTON_PIN) == LOW;
+	if (nextHeld && prevHeld) {
+		if (muteComboStartedAt == 0) muteComboStartedAt = now;
+		if (!muteComboTriggered && now - muteComboStartedAt >= 500) {
+			Serial.println("Next+Prev: powrót do przeglądarki");
+			enterBrowser();
+			muteComboTriggered = true;
+		}
+	} else if (!nextHeld && !prevHeld) {
+		muteComboStartedAt = 0;
+		muteComboTriggered = false;
+	}
+
 	if (nextReleased && nextPressed) {
 		nextReleased = false;
 		nextPressed = false;
-		if (now - lastButtonMillis > 300) {
+		if (!muteComboTriggered && now - lastButtonMillis > 300) {
 			lastButtonMillis = now;
-			if (currentScreen == SCREEN_BROWSER) {
+			if (playPressed && now - nextPressMillis < LONG_PRESS_MS) {
+				volumeUp();
+				playModifierUsed = true;
+			} else if (currentScreen == SCREEN_BROWSER) {
 				moveBrowserSelection(1);
 			} else if (now - nextPressMillis >= LONG_PRESS_MS) {
 				seekByBytes(SEEK_BYTES_10_SECONDS);
@@ -659,13 +866,13 @@ void loop() {
 	if (prevReleased && prevPressed) {
 		prevReleased = false;
 		prevPressed = false;
-		if (now - lastButtonMillis > 300) {
+		if (!muteComboTriggered && now - lastButtonMillis > 300) {
 			lastButtonMillis = now;
-			if (currentScreen == SCREEN_BROWSER) {
+			if (playPressed && now - prevPressMillis < LONG_PRESS_MS) {
+				volumeDown();
+				playModifierUsed = true;
+			} else if (currentScreen == SCREEN_BROWSER) {
 				moveBrowserSelection(-1);
-			} else if (now - prevPressMillis >= BROWSER_RETURN_MS) {
-				Serial.println("Powrót do przeglądarki");
-				enterBrowser();
 			} else if (now - prevPressMillis >= LONG_PRESS_MS) {
 				seekByBytes(-static_cast<int32_t>(SEEK_BYTES_10_SECONDS));
 			} else {
@@ -679,39 +886,32 @@ void loop() {
 	if (playReleased && playPressed) {
 		playReleased = false;
 		playPressed = false;
-		if (now - lastButtonMillis > 300) {
+		if (playModifierUsed) {
+			playModifierUsed = false;
+		} else if (now - lastButtonMillis > 300) {
 			lastButtonMillis = now;
-			if (currentScreen == SCREEN_BROWSER) {
-				if (now - playPressMillis < LONG_PRESS_MS) selectBrowserEntry();
-			} else if (now - playPressMillis >= LONG_PRESS_MS) {
+			if (now - playPressMillis >= LONG_PRESS_MS) {
 				Serial.println("Długie PLAY: stop");
+				playClickPending = false;
 				stopPlayback();
+			} else if (playClickPending && now - lastPlayReleaseMillis <= PLAY_DOUBLE_CLICK_MS) {
+				Serial.println("Podwójny PLAY: mute/unmute");
+				playClickPending = false;
+				toggleMute();
 			} else {
-				togglePlayPause();
+				playClickPending = true;
+				lastPlayReleaseMillis = now;
 			}
 		}
 	}
 
-	size_t trackToDisplay;
-	xSemaphoreTake(stateMutex, portMAX_DELAY);
-	trackToDisplay = currentTrack;
-	xSemaphoreGive(stateMutex);
-	xSemaphoreTake(audioMutex, portMAX_DELAY);
-	bool pausedToDisplay = playbackPaused || playbackStopped;
-	xSemaphoreGive(audioMutex);
-	if (currentScreen == SCREEN_NOWPLAYING &&
-		(trackToDisplay != displayedTrack || pausedToDisplay != displayedPaused)) {
-		displayDirty = true;
-	}
-	if (displayDirty) {
+	if (playClickPending && now - lastPlayReleaseMillis > PLAY_DOUBLE_CLICK_MS) {
+		playClickPending = false;
 		if (currentScreen == SCREEN_BROWSER) {
-			drawBrowser();
+			selectBrowserEntry();
 		} else {
-			drawNowPlaying();
+			togglePlayPause();
 		}
-		displayedTrack = trackToDisplay;
-		displayedPaused = pausedToDisplay;
-		displayDirty = false;
 	}
 
 	if (currentScreen == SCREEN_NOWPLAYING) {
