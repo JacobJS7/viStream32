@@ -56,6 +56,7 @@ struct DirectoryEntry {
 	String name;
 	bool isDirectory;
 	bool isParent;
+	uint32_t size;
 };
 
 ESP32I2SAudio audio(I2S_BCLK, I2S_LRC, I2S_DOUT);
@@ -194,7 +195,7 @@ bool scanDirectory(const char *path) {
 	}
 
 	if (String(path) != "/") {
-		scannedEntries.push_back({"..", true, true});
+		scannedEntries.push_back({"..", true, true, 0});
 	}
 
 	File entry = dir.openNextFile();
@@ -203,7 +204,7 @@ bool scanDirectory(const char *path) {
 		int separator = name.lastIndexOf('/');
 		if (separator >= 0) name = name.substring(separator + 1);
 		if (entry.isDirectory() || name.endsWith(".mp3") || name.endsWith(".MP3")) {
-			scannedEntries.push_back({name, entry.isDirectory(), false});
+			scannedEntries.push_back({name, entry.isDirectory(), false, entry.isDirectory() ? 0 : static_cast<uint32_t>(entry.size())});
 		}
 		entry.close();
 		entry = dir.openNextFile();
@@ -558,17 +559,23 @@ const char remotePage[] PROGMEM = R"HTML(
 <title>vistream32</title><style>
 body{font-family:sans-serif;max-width:480px;margin:24px auto;padding:0 16px;background:#111;color:#eee}
 button{font-size:18px;margin:4px;padding:10px 16px}input{width:100%}#title{font-size:20px;margin:20px 0 8px}
+.file{padding:8px 0;border-bottom:1px solid #333}.file a{float:right;color:#7cf}
 </style></head><body><h1>vistream32</h1><div id="title">Loading...</div>
 <button onclick="post('/prev')">Prev</button><button id="playPauseButton" onclick="togglePlayPause()">Play</button><button onclick="post('/next')">Next</button>
 <p>Volume: <span id="vol">0</span>%</p><input id="volume" type="range" min="0" max="100" value="0" oninput="setVolume(this.value)">
 <p>Position: <span id="time">00:00 / 00:00</span></p><input id="seek" type="range" min="0" max="1" value="0" oninput="setSeek(this.value)">
+<h2>Files</h2><div><span id="filesPath">/</span></div><div id="files">Loading...</div>
 <script>
-let seekTimer;let isPaused=true;async function post(path){await fetch(path,{method:'POST'});refresh()}
+let seekTimer;let isPaused=true;let filesPath='/';async function post(path){await fetch(path,{method:'POST'});refresh()}
 function togglePlayPause(){post(isPaused?'/play':'/pause')}
 function setVolume(value){document.querySelector('#vol').textContent=value;clearTimeout(window.volumeTimer);window.volumeTimer=setTimeout(()=>fetch('/volume?value='+value,{method:'POST'}),120)}
 function setSeek(value){clearTimeout(seekTimer);seekTimer=setTimeout(()=>fetch('/seek?position='+value,{method:'POST'}),200)}
 async function refresh(){let s=await (await fetch('/status')).json();isPaused=s.paused;document.querySelector('#playPauseButton').textContent=isPaused?'Play':'Pause';document.querySelector('#title').textContent=s.track;document.querySelector('#vol').textContent=s.volume;document.querySelector('#volume').value=s.volume;document.querySelector('#seek').max=s.duration;document.querySelector('#seek').value=s.position;document.querySelector('#time').textContent=s.positionText+' / '+s.durationText}
-refresh();setInterval(refresh,1500);
+function parentPath(path){if(path==='/')return '/';let i=path.lastIndexOf('/');return i<=0?'/':path.slice(0,i)}
+const listContainer=document.querySelector('#files');
+listContainer.addEventListener('click',(event)=>{const el=event.target.closest('[data-path]');if(!el)return;console.log('Kliknięto:',el.dataset.path,'isDir:',el.dataset.isDir);if(el.dataset.isDir==='1'){loadFiles(el.dataset.path)}else{window.location.href='/download?path='+encodeURIComponent(el.dataset.path)}});
+async function loadFiles(path){filesPath=path||'/';let entries=await (await fetch('/files?path='+encodeURIComponent(filesPath))).json();document.querySelector('#filesPath').textContent=filesPath;listContainer.replaceChildren();entries.forEach(e=>{const el=document.createElement('div');el.className='file';const full=e.name==='..'?parentPath(filesPath):(filesPath==='/'?'/'+e.name:filesPath+'/'+e.name);el.dataset.path=full;el.dataset.isDir=e.isDirectory?'1':'0';el.textContent=(e.isDirectory?'[D] ':'')+e.name;if(!e.isDirectory)el.textContent+=' ('+e.size+' B) Download';listContainer.appendChild(el)});if(!entries.length)listContainer.textContent='Empty'}
+refresh();loadFiles('/');setInterval(refresh,1500);
 </script></body></html>
 )HTML";
 
@@ -668,6 +675,63 @@ void webSeek() {
 	webServer.send(200, "text/plain", "OK");
 }
 
+void webFiles() {
+	String path = webServer.hasArg("path") ? webServer.arg("path") : "/";
+	if (!path.startsWith("/")) path = "/" + path;
+	if (!scanDirectory(path.c_str())) {
+		webServer.send(404, "application/json", "{\"error\":\"directory not found\"}");
+		return;
+	}
+
+	String json = "[";
+	for (size_t index = 0; index < directoryEntries.size(); ++index) {
+		const DirectoryEntry &entry = directoryEntries[index];
+		if (index > 0) json += ",";
+		json += "{\"name\":\"" + jsonEscape(entry.name) + "\",\"isDirectory\":";
+		json += entry.isDirectory ? "true" : "false";
+		json += ",\"size\":" + String(entry.size) + "}";
+	}
+	json += "]";
+	webServer.send(200, "application/json", json);
+}
+
+void webDownload() {
+	String path = webServer.hasArg("path") ? webServer.arg("path") : "";
+	if (!path.startsWith("/") || path.indexOf("..") >= 0) {
+		webServer.send(400, "text/plain", "Invalid path");
+		return;
+	}
+
+	xSemaphoreTake(sdMutex, portMAX_DELAY);
+	File download = SD.open(path.c_str(), FILE_READ);
+	bool validFile = download && !download.isDirectory();
+	uint32_t fileSize = validFile ? static_cast<uint32_t>(download.size()) : 0;
+	xSemaphoreGive(sdMutex);
+	if (!validFile) {
+		webServer.send(404, "text/plain", "File not found");
+		return;
+	}
+
+	String fileName = path.substring(path.lastIndexOf('/') + 1);
+	String contentType = (fileName.endsWith(".mp3") || fileName.endsWith(".MP3")) ? "audio/mpeg" : "application/octet-stream";
+	webServer.sendHeader("Content-Disposition", "attachment; filename=\"" + fileName + "\"");
+	webServer.setContentLength(fileSize);
+	webServer.send(200, contentType, "");
+	WiFiClient client = webServer.client();
+	uint8_t buffer[1024];
+	while (download) {
+		xSemaphoreTake(sdMutex, portMAX_DELAY);
+		bool hasData = download.available();
+		size_t count = hasData ? download.read(buffer, sizeof(buffer)) : 0;
+		xSemaphoreGive(sdMutex);
+		if (!hasData || count == 0 || client.write(buffer, count) != count) break;
+		taskYIELD();
+	}
+	xSemaphoreTake(sdMutex, portMAX_DELAY);
+	download.close();
+	xSemaphoreGive(sdMutex);
+}
+
 void setupWebServer() {
 	WiFi.mode(WIFI_AP);
 	WiFi.softAP(WIFI_AP_SSID, WIFI_AP_PASSWORD);
@@ -683,6 +747,8 @@ void setupWebServer() {
 	webServer.on("/prev", HTTP_POST, webPrev);
 	webServer.on("/volume", HTTP_POST, webVolume);
 	webServer.on("/seek", HTTP_POST, webSeek);
+	webServer.on("/files", HTTP_GET, webFiles);
+	webServer.on("/download", HTTP_GET, webDownload);
 	webServer.begin();
 }
 
