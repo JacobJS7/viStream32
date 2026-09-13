@@ -1,4 +1,6 @@
 #include <Arduino.h>
+#include <WiFi.h>
+#include <WebServer.h>
 #include <ESP32I2SAudio.h>
 #include <SD.h>
 #include <BackgroundAudio.h>
@@ -16,6 +18,10 @@
 #define I2C_SCL   22
 
 #define SD_CS     5
+#define BATTERY_ADC_PIN 34
+#define BATTERY_ADC_SAMPLES 12
+#define VOLTAGE_DIVIDER_RATIO 2.0f
+#define BATTERY_SAMPLE_INTERVAL_MS 3000UL
 #define NEXT_BUTTON_PIN 4
 #define PREV_BUTTON_PIN 33
 #define PLAY_BUTTON_PIN 32
@@ -32,6 +38,8 @@
 #define DEFAULT_GAIN 0.005f
 #define MAX_GAIN 0.05f
 #define GAIN_STEP 0.0025f
+#define WIFI_AP_SSID "vistream32"
+#define WIFI_AP_PASSWORD "vistream1234"
 
 enum RepeatMode : uint8_t {
 	REPEAT_OFF,
@@ -88,6 +96,8 @@ SemaphoreHandle_t stateMutex;
 SemaphoreHandle_t sdMutex;
 TaskHandle_t audioTaskHandle = nullptr;
 TaskHandle_t uiTaskHandle = nullptr;
+TaskHandle_t wifiTaskHandle = nullptr;
+WebServer webServer(80);
 size_t displayedTrack = static_cast<size_t>(-1);
 bool displayedPaused = false;
 volatile bool playbackPaused = false;
@@ -108,9 +118,21 @@ volatile uint32_t currentTrackDurationSec = 1;
 volatile uint32_t screenTransitionStart = 0;
 Screen previousScreen = SCREEN_BROWSER;
 float batteryVoltage = 4.2f;
+uint32_t lastBatterySampleMillis = 0;
 
 bool isWifiClientConnected();
 void showVolumeOverlay();
+
+void updateBatteryVoltage() {
+	uint32_t rawTotal = 0;
+	for (uint8_t sample = 0; sample < BATTERY_ADC_SAMPLES; ++sample) {
+		rawTotal += analogRead(BATTERY_ADC_PIN);
+	}
+	float rawAverage = static_cast<float>(rawTotal) / BATTERY_ADC_SAMPLES;
+	batteryVoltage = (rawAverage / 4095.0f) * 3.3f * VOLTAGE_DIVIDER_RATIO;
+	Serial.print("batteryVoltage: ");
+	Serial.println(batteryVoltage, 3);
+}
 
 void IRAM_ATTR handleNextISR() {
 	if (digitalRead(NEXT_BUTTON_PIN) == LOW) {
@@ -523,12 +545,154 @@ void volumeDown() {
 }
 
 bool isWifiClientConnected() {
-	return false;
+	return WiFi.softAPgetStationNum() > 0;
 }
 
 void showVolumeOverlay() {
 	volumeOverlayUntil = millis() + UI_VOLUME_OVERLAY_MS;
 	displayDirty = true;
+}
+
+const char remotePage[] PROGMEM = R"HTML(
+<!doctype html><html><head><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>vistream32</title><style>
+body{font-family:sans-serif;max-width:480px;margin:24px auto;padding:0 16px;background:#111;color:#eee}
+button{font-size:18px;margin:4px;padding:10px 16px}input{width:100%}#title{font-size:20px;margin:20px 0 8px}
+</style></head><body><h1>vistream32</h1><div id="title">Loading...</div>
+<button onclick="post('/prev')">Prev</button><button id="playPauseButton" onclick="togglePlayPause()">Play</button><button onclick="post('/next')">Next</button>
+<p>Volume: <span id="vol">0</span>%</p><input id="volume" type="range" min="0" max="100" value="0" oninput="setVolume(this.value)">
+<p>Position: <span id="time">00:00 / 00:00</span></p><input id="seek" type="range" min="0" max="1" value="0" oninput="setSeek(this.value)">
+<script>
+let seekTimer;let isPaused=true;async function post(path){await fetch(path,{method:'POST'});refresh()}
+function togglePlayPause(){post(isPaused?'/play':'/pause')}
+function setVolume(value){document.querySelector('#vol').textContent=value;clearTimeout(window.volumeTimer);window.volumeTimer=setTimeout(()=>fetch('/volume?value='+value,{method:'POST'}),120)}
+function setSeek(value){clearTimeout(seekTimer);seekTimer=setTimeout(()=>fetch('/seek?position='+value,{method:'POST'}),200)}
+async function refresh(){let s=await (await fetch('/status')).json();isPaused=s.paused;document.querySelector('#playPauseButton').textContent=isPaused?'Play':'Pause';document.querySelector('#title').textContent=s.track;document.querySelector('#vol').textContent=s.volume;document.querySelector('#volume').value=s.volume;document.querySelector('#seek').max=s.duration;document.querySelector('#seek').value=s.position;document.querySelector('#time').textContent=s.positionText+' / '+s.durationText}
+refresh();setInterval(refresh,1500);
+</script></body></html>
+)HTML";
+
+String jsonEscape(const String &value) {
+	String escaped;
+	for (size_t index = 0; index < value.length(); ++index) {
+		char character = value[index];
+		if (character == '"' || character == '\\') escaped += '\\';
+		if (character == '\n') escaped += "\\n";
+		else if (character != '\r') escaped += character;
+	}
+	return escaped;
+}
+
+String formatTime(uint32_t seconds) {
+	char buffer[8];
+	snprintf(buffer, sizeof(buffer), "%02lu:%02lu", seconds / 60, seconds % 60);
+	return String(buffer);
+}
+
+void sendPlayerStatus() {
+	updatePlaybackPosition();
+	String track;
+	uint32_t position;
+	uint32_t duration;
+	bool paused;
+	bool shuffle;
+	RepeatMode repeat;
+	xSemaphoreTake(stateMutex, portMAX_DELAY);
+	track = tracks.empty() ? String("") : tracks[currentTrack];
+	position = currentPositionSec;
+	shuffle = shuffleEnabled;
+	repeat = repeatMode;
+	xSemaphoreGive(stateMutex);
+	xSemaphoreTake(audioMutex, portMAX_DELAY);
+	paused = playbackPaused || playbackStopped;
+	float gain = currentGain;
+	xSemaphoreGive(audioMutex);
+	duration = currentTrackDurationSec;
+	int separator = track.lastIndexOf('/');
+	if (separator >= 0) track = track.substring(separator + 1);
+	uint32_t displayPosition = min(position, duration);
+	int volume = static_cast<int>(gain * 100.0f / MAX_GAIN);
+	String mode = shuffle ? "shuffle" : (repeat == REPEAT_ONE ? "repeat-one" : (repeat == REPEAT_ALL ? "repeat-all" : "normal"));
+	String json = "{\"track\":\"" + jsonEscape(track) + "\",\"position\":" + String(displayPosition) +
+		",\"duration\":" + String(duration) + ",\"volume\":" + String(volume) +
+		",\"paused\":" + String(paused ? "true" : "false") + ",\"mode\":\"" + mode +
+		"\",\"positionText\":\"" + formatTime(displayPosition) + "\",\"durationText\":\"" + formatTime(duration) + "\"}";
+	webServer.send(200, "application/json", json);
+}
+
+void webPlay() {
+	Serial.println("Otrzymano /play");
+	if (playbackPaused || playbackStopped) togglePlayPause();
+	webServer.send(200, "text/plain", "OK");
+}
+
+void webPause() {
+	Serial.println("Otrzymano /pause");
+	if (!playbackPaused && !playbackStopped) togglePlayPause();
+	webServer.send(200, "text/plain", "OK");
+}
+
+void webNext() {
+	closeTrack();
+	advanceTrack();
+	setScreen(SCREEN_NOWPLAYING);
+	webServer.send(200, "text/plain", "OK");
+}
+
+void webPrev() {
+	closeTrack();
+	retreatTrack();
+	setScreen(SCREEN_NOWPLAYING);
+	webServer.send(200, "text/plain", "OK");
+}
+
+void webVolume() {
+	int value = constrain(webServer.arg("value").toInt(), 0, 100);
+	xSemaphoreTake(audioMutex, portMAX_DELAY);
+	currentGain = MAX_GAIN * value / 100.0f;
+	mp3.setGain(currentGain);
+	xSemaphoreGive(audioMutex);
+	Serial.print("currentGain: ");
+	Serial.println(currentGain, 3);
+	requestStateSave();
+	showVolumeOverlay();
+	webServer.send(200, "text/plain", "OK");
+}
+
+void webSeek() {
+	int32_t requestedPosition = static_cast<int32_t>(webServer.arg("position").toInt());
+	uint32_t target = requestedPosition < 0 ? 0 : static_cast<uint32_t>(requestedPosition);
+	updatePlaybackPosition();
+	int32_t delta = static_cast<int32_t>(target) - static_cast<int32_t>(currentPositionSec);
+	seekByBytes(delta * static_cast<int32_t>(APPROXIMATE_MP3_BYTES_PER_SECOND));
+	webServer.send(200, "text/plain", "OK");
+}
+
+void setupWebServer() {
+	WiFi.mode(WIFI_AP);
+	WiFi.softAP(WIFI_AP_SSID, WIFI_AP_PASSWORD);
+	Serial.print("Wi-Fi AP: ");
+	Serial.println(WIFI_AP_SSID);
+	Serial.print("AP IP: ");
+	Serial.println(WiFi.softAPIP());
+	webServer.on("/", HTTP_GET, []() { webServer.send_P(200, "text/html", remotePage); });
+	webServer.on("/status", HTTP_GET, sendPlayerStatus);
+	webServer.on("/play", HTTP_POST, webPlay);
+	webServer.on("/pause", HTTP_POST, webPause);
+	webServer.on("/next", HTTP_POST, webNext);
+	webServer.on("/prev", HTTP_POST, webPrev);
+	webServer.on("/volume", HTTP_POST, webVolume);
+	webServer.on("/seek", HTTP_POST, webSeek);
+	webServer.begin();
+}
+
+void wifiTask(void *parameter) {
+	(void)parameter;
+	setupWebServer();
+	for (;;) {
+		webServer.handleClient();
+		vTaskDelay(pdMS_TO_TICKS(2));
+	}
 }
 
 void refreshBrowser() {
@@ -866,6 +1030,9 @@ void setup() {
 		fail();
 	}
 	Serial.println("Karta SD OK");
+	analogReadResolution(12);
+	analogSetAttenuation(ADC_11db);
+	updateBatteryVoltage();
 	splashProgress = 40;
 
 	audio.setPins(I2S_BCLK, I2S_LRC, I2S_DOUT);
@@ -915,6 +1082,15 @@ void setup() {
 			&audioTaskHandle,
 			1);
 
+	xTaskCreatePinnedToCore(
+			wifiTask,
+			"wifi-http",
+			6144,
+			nullptr,
+			1,
+			&wifiTaskHandle,
+			0);
+
 	pinMode(NEXT_BUTTON_PIN, INPUT_PULLUP);
 	pinMode(PREV_BUTTON_PIN, INPUT_PULLUP);
 	pinMode(PLAY_BUTTON_PIN, INPUT_PULLUP);
@@ -925,6 +1101,10 @@ void setup() {
 
 void loop() {
 	unsigned long now = millis();
+	if (now - lastBatterySampleMillis >= BATTERY_SAMPLE_INTERVAL_MS) {
+		lastBatterySampleMillis = now;
+		updateBatteryVoltage();
+	}
 	bool nextHeld = digitalRead(NEXT_BUTTON_PIN) == LOW;
 	bool prevHeld = digitalRead(PREV_BUTTON_PIN) == LOW;
 	if (nextHeld && prevHeld) {
