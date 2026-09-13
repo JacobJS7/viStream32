@@ -29,6 +29,9 @@
 #define UI_TRANSITION_MS 240UL
 #define UI_VOLUME_OVERLAY_MS 1500UL
 #define BATTERY_WARNING_VOLTAGE 3.4f
+#define DEFAULT_GAIN 0.005f
+#define MAX_GAIN 0.05f
+#define GAIN_STEP 0.0025f
 
 enum Screen : uint8_t {
 	SCREEN_BROWSER,
@@ -80,8 +83,8 @@ size_t displayedTrack = static_cast<size_t>(-1);
 bool displayedPaused = false;
 volatile bool playbackPaused = false;
 volatile bool playbackStopped = false;
-float currentGain = 0.05f;
-float gainBeforeMute = 0.05f;
+float currentGain = DEFAULT_GAIN;
+float gainBeforeMute = DEFAULT_GAIN;
 bool muted = false;
 Preferences preferences;
 bool shuffleEnabled = false;
@@ -397,7 +400,7 @@ void seekByBytes(int32_t delta) {
 
 void volumeUp() {
 	xSemaphoreTake(audioMutex, portMAX_DELAY);
-	currentGain = min(currentGain + 0.01f, 1.0f);
+	currentGain = min(currentGain + GAIN_STEP, MAX_GAIN);
 	if (!muted) mp3.setGain(currentGain);
 	xSemaphoreGive(audioMutex);
 	Serial.print("currentGain: ");
@@ -408,7 +411,7 @@ void volumeUp() {
 
 void volumeDown() {
 	xSemaphoreTake(audioMutex, portMAX_DELAY);
-	currentGain = max(currentGain - 0.01f, 0.0f);
+	currentGain = max(currentGain - GAIN_STEP, 0.0f);
 	if (!muted) mp3.setGain(currentGain);
 	xSemaphoreGive(audioMutex);
 	Serial.print("currentGain: ");
@@ -656,7 +659,7 @@ void drawNowPlaying() {
 	}
 	if (static_cast<int32_t>(volumeOverlayUntil - now) > 0) {
 		char volumeText[16];
-		snprintf(volumeText, sizeof(volumeText), "Vol: %d%%", static_cast<int>(displayGain * 100));
+		snprintf(volumeText, sizeof(volumeText), "Vol: %d%%", static_cast<int>(displayGain * 100.0f / MAX_GAIN));
 		u8g2.setDrawColor(0);
 		u8g2.drawBox(52, 44, 76, 18);
 		u8g2.setDrawColor(1);
@@ -750,7 +753,7 @@ void setup() {
 	Serial.begin(9600);
 	Serial.println("MP3 player - BackgroundAudioMP3 example");
 	preferences.begin("vistream", false);
-	currentGain = constrain(preferences.getFloat("lastVolume", currentGain), 0.0f, 1.0f);
+	currentGain = constrain(preferences.getFloat("lastVolume", currentGain), 0.0f, MAX_GAIN);
 	shuffleEnabled = preferences.getBool("shuffle", false);
 
 	Wire.begin(I2C_SDA, I2C_SCL);
