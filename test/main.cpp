@@ -1,0 +1,169 @@
+#include <Arduino.h>
+#include <WiFi.h>
+#include <ESP32I2SAudio.h>
+#include <SD.h>
+#include <BackgroundAudio.h>
+#include <SPI.h>
+#include <vector>
+
+// Piny I2S
+#define I2S_BCLK  26
+#define I2S_LRC   25
+#define I2S_DOUT  22
+
+// Piny SD
+#define SD_CS     5
+//mosi#define SD_MOSI   23
+//miso#define SD_MISO   19
+//sclk#define SD_SCK    18
+
+ESP32I2SAudio audio(I2S_BCLK, I2S_LRC, I2S_DOUT); // BCLK, LRCLK, DOUT
+BackgroundAudioMP3 mp3(audio);
+
+// SD file and buffer
+File f;
+uint8_t filebuff[512];
+std::vector<String> tracks;
+size_t currentTrack = 0;
+// Next button
+#define NEXT_BUTTON_PIN 4
+volatile bool nextRequested = false;
+unsigned long lastButtonMillis = 0;
+
+void IRAM_ATTR handleNextISR() { nextRequested = true; }
+
+void scanMusicDir() {
+  tracks.clear();
+  File dir = SD.open("/muzyka");
+  if (!dir) {
+    Serial.println("Brak folderu /muzyka");
+    return;
+  }
+  File entry = dir.openNextFile();
+  while (entry) {
+    if (!entry.isDirectory()) {
+      String name = entry.name();
+      if (name.endsWith(".mp3") || name.endsWith(".MP3")) {
+        String full = String("/muzyka/") + name;
+        tracks.push_back(full);
+      }
+    }
+    entry.close();
+    entry = dir.openNextFile();
+  }
+  dir.close();
+  Serial.print("Znaleziono utworów: "); Serial.println((int)tracks.size());
+}
+
+bool openTrack(size_t idx) {
+  if (tracks.empty()) return false;
+  if (idx >= tracks.size()) idx = 0;
+  if (f) { f.close(); }
+  const char *p = tracks[idx].c_str();
+  Serial.print("Otwieram: "); Serial.println(p);
+  f = SD.open(p);
+  if (!f) {
+    Serial.print("Nie można otworzyć pliku: "); Serial.println(p);
+    return false;
+  }
+  // Reset decoder for new track
+  mp3.flush();
+  return true;
+}
+
+void fail() {
+  while (1) {
+    delay(1000);
+    ESP.restart();
+  }
+}
+
+void setup() {
+  Serial.begin(9600);
+  Serial.println("MP3 player - BackgroundAudioMP3 example");
+
+  // Initialize SD
+  if (!SD.begin(SD_CS)) {
+    Serial.println("Błąd karty SD!");
+    fail();
+  }
+  Serial.println("Karta SD OK");
+
+  // Initialize audio output
+  audio.setPins(I2S_BCLK, I2S_LRC, I2S_DOUT);
+  // set gain on BackgroundAudioMP3 (scale 0.0..16.0)
+  mp3.setGain(0.05f);
+
+  // Scan music folder and start playback
+  scanMusicDir();
+  if (tracks.empty()) {
+    Serial.println("Brak utworów w /muzyka");
+    fail();
+  }
+
+  // Start the MP3 background decoder/player
+  if (!mp3.begin()) {
+    Serial.println("Nie udało się uruchomić MP3 playera");
+    fail();
+  }
+
+  // Open first track
+  currentTrack = 0;
+  if (!openTrack(currentTrack)) {
+    Serial.println("Błąd otwierania pierwszego utworu");
+    fail();
+  }
+
+  // Configure next-track button (active LOW)
+  pinMode(NEXT_BUTTON_PIN, INPUT_PULLUP);
+  attachInterrupt(digitalPinToInterrupt(NEXT_BUTTON_PIN), handleNextISR, FALLING);
+}
+
+void loop() {
+  // If no file open, try to open next track
+  if (!f) {
+    // advance to next track
+    currentTrack = (currentTrack + 1) % tracks.size();
+    if (!openTrack(currentTrack)) {
+      // If can't open, try next after short delay
+      delay(200);
+      return;
+    }
+  }
+
+  // Handle next-track button request (debounced in software)
+  if (nextRequested) {
+    unsigned long now = millis();
+    if (now - lastButtonMillis > 300) { // debounce 300ms
+      lastButtonMillis = now;
+      nextRequested = false;
+      Serial.println("Przycisk NEXT: pomijanie utworu");
+      if (f) {
+        f.close();
+      }
+      currentTrack = (currentTrack + 1) % tracks.size();
+      openTrack(currentTrack);
+    } else {
+      // clear the flag if within debounce window
+      nextRequested = false;
+    }
+  }
+
+  // Feed data to the background MP3 decoder when there's room
+  while (f && mp3.availableForWrite() > 512) {
+    int len = f.read(filebuff, sizeof(filebuff));
+    if (len > 0) {
+      mp3.write(filebuff, len);
+    }
+    if (len != (int)sizeof(filebuff)) {
+      // Reached EOF (or read smaller chunk) -> close and allow loop() to open next
+      f.close();
+      Serial.println("Koniec utworu: zamknięto plik SD");
+      break;
+    }
+  }
+  delay(10);
+}
+
+void audio_info(const char *info)       { Serial.println(info); }
+void audio_eof_mp3(const char *info)    { Serial.println("Koniec pliku"); }

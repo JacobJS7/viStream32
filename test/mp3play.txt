@@ -1,0 +1,87 @@
+#include <Arduino.h>
+#include <WiFi.h>
+#include <ESP32I2SAudio.h>
+#include <SD.h>
+#include <SPI.h>
+#include <BackgroundAudioMP3.h>
+
+// Piny I2S
+#define I2S_BCLK  26
+#define I2S_LRC   25
+#define I2S_DOUT  22
+
+// Piny SD
+#define SD_CS     5
+//mosi#define SD_MOSI   23
+//miso#define SD_MISO   19
+//sclk#define SD_SCK    18
+
+ESP32I2SAudio audio(I2S_BCLK, I2S_LRC, I2S_DOUT); // BCLK, LRCLK, DOUT
+
+// Background MP3 player using an 8KB raw buffer
+BackgroundAudioMP3 mp3(audio);
+
+// SD file and buffer
+File f;
+uint8_t filebuff[512];
+
+void fail() {
+  while (1) {
+    delay(1000);
+    ESP.restart();
+  }
+}
+
+void setup() {
+  Serial.begin(9600);
+  Serial.println("MP3 player - BackgroundAudioMP3 example");
+
+  // Initialize SD
+  if (!SD.begin(SD_CS)) {
+    Serial.println("Błąd karty SD!");
+    fail();
+  }
+  Serial.println("Karta SD OK");
+
+  // Initialize audio output
+  audio.setPins(I2S_BCLK, I2S_LRC, I2S_DOUT);
+  // set gain on BackgroundAudioMP3 (scale 0.0..16.0)
+  mp3.setGain(0.1f);
+
+  // Open MP3 file
+  const char *path = "/muzyka/sample.mp3";
+  f = SD.open(path);
+  if (!f) {
+    Serial.print("Nie można otworzyć pliku: ");
+    Serial.println(path);
+    fail();
+  }
+  Serial.print("Otworzono: ");
+  Serial.println(path);
+
+  // Start the MP3 background decoder/player
+  if (!mp3.begin()) {
+    Serial.println("Nie udało się uruchomić MP3 playera");
+    fail();
+  }
+}
+
+void loop() {
+  // Feed data to the background MP3 decoder when there's room
+  while (f && mp3.availableForWrite() > 512) {
+    int len = f.read(filebuff, sizeof(filebuff));
+    if (len > 0) {
+      mp3.write(filebuff, len);
+    }
+    if (len != (int)sizeof(filebuff)) {
+      // Reached EOF (or read smaller chunk)
+      f.close();
+      Serial.println("Koniec pliku: zamknięto plik SD");
+      break;
+    }
+  }
+  delay(10);
+}
+
+void audio_info(const char *info)       { Serial.println(info); }
+void audio_eof_mp3(const char *info)    { Serial.println("Koniec pliku"); }
