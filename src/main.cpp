@@ -27,9 +27,9 @@ std::vector<String> tracks;
 size_t currentTrack = 0;
 
 volatile bool nextRequested = false;
-volatile bool trackEnded = false;
 unsigned long lastButtonMillis = 0;
 SemaphoreHandle_t audioMutex;
+SemaphoreHandle_t stateMutex;
 TaskHandle_t audioTaskHandle = nullptr;
 
 void IRAM_ATTR handleNextISR() { nextRequested = true; }
@@ -75,8 +75,14 @@ bool openTrack(size_t idx) {
 		Serial.println("Nie można otworzyć pliku");
 		return false;
 	}
-	trackEnded = false;
 	return true;
+}
+
+void advanceTrack() {
+	xSemaphoreTake(stateMutex, portMAX_DELAY);
+	currentTrack = (currentTrack + 1) % tracks.size();
+	openTrack(currentTrack);
+	xSemaphoreGive(stateMutex);
 }
 
 void closeTrack() {
@@ -89,6 +95,7 @@ void audioFeedTask(void *parameter) {
 	(void)parameter;
 	for (;;) {
 		bool fedData = false;
+		bool reachedEnd = false;
 
 		xSemaphoreTake(audioMutex, portMAX_DELAY);
 		while (f && mp3.availableForWrite() > 512) {
@@ -99,7 +106,7 @@ void audioFeedTask(void *parameter) {
 			}
 			if (len != (int)sizeof(filebuff)) {
 				f.close();
-				trackEnded = true;
+				reachedEnd = true;
 				Serial.println("Koniec utworu: zamknięto plik SD");
 				break;
 			}
@@ -107,11 +114,17 @@ void audioFeedTask(void *parameter) {
 		xSemaphoreGive(audioMutex);
 
 		if (!fedData) vTaskDelay(pdMS_TO_TICKS(10));
+
+		if (reachedEnd) {
+			advanceTrack();
+		}
 	}
 }
 
 void drawNowPlaying() {
+	xSemaphoreTake(stateMutex, portMAX_DELAY);
 	String title = tracks.empty() ? String("Brak utworu") : tracks[currentTrack];
+	xSemaphoreGive(stateMutex);
 	int separator = title.lastIndexOf('/');
 	if (separator >= 0) title = title.substring(separator + 1);
 
@@ -163,7 +176,8 @@ void setup() {
 	}
 
 	audioMutex = xSemaphoreCreateMutex();
-	if (audioMutex == nullptr || !openTrack(0)) fail();
+	stateMutex = xSemaphoreCreateMutex();
+	if (audioMutex == nullptr || stateMutex == nullptr || !openTrack(0)) fail();
 
 	xTaskCreatePinnedToCore(
 			audioFeedTask,
@@ -180,12 +194,6 @@ void setup() {
 }
 
 void loop() {
-	if (trackEnded) {
-		currentTrack = (currentTrack + 1) % tracks.size();
-		openTrack(currentTrack);
-		drawNowPlaying();
-	}
-
 	if (nextRequested) {
 		unsigned long now = millis();
 		nextRequested = false;
@@ -193,8 +201,7 @@ void loop() {
 			lastButtonMillis = now;
 			Serial.println("Przycisk NEXT: pomijanie utworu");
 			closeTrack();
-			currentTrack = (currentTrack + 1) % tracks.size();
-			openTrack(currentTrack);
+			advanceTrack();
 			drawNowPlaying();
 		}
 	}
