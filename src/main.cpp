@@ -25,8 +25,11 @@
 #define NEXT_BUTTON_PIN 4
 #define PREV_BUTTON_PIN 33
 #define PLAY_BUTTON_PIN 32
+#define WIFI_SWITCH_PIN 16
+#define BROWSER_BUTTON_PIN 17
 #define LONG_PRESS_MS 800
 #define PLAY_DOUBLE_CLICK_MS 400
+#define WIFI_SWITCH_POLL_MS 250UL
 #define SEEK_BYTES_10_SECONDS 160000UL
 #define STATE_SAVE_INTERVAL_MS 12000UL
 #define APPROXIMATE_MP3_BYTES_PER_SECOND 16000UL
@@ -66,6 +69,7 @@ U8G2_SSD1306_128X64_NONAME_F_HW_I2C u8g2(U8G2_R0, U8X8_PIN_NONE);
 File f;
 File uploadFile;
 String uploadTargetPath;
+bool uploadFailed = false;
 uint8_t filebuff[512];
 std::vector<String> tracks;
 size_t currentTrack = 0;
@@ -82,17 +86,20 @@ volatile bool displayDirty = true;
 volatile bool nextPressed = false;
 volatile bool prevPressed = false;
 volatile bool playPressed = false;
+volatile bool browserPressed = false;
 volatile bool nextReleased = false;
 volatile bool prevReleased = false;
 volatile bool playReleased = false;
+volatile bool browserReleased = false;
 volatile uint32_t nextPressMillis = 0;
 volatile uint32_t prevPressMillis = 0;
 volatile uint32_t playPressMillis = 0;
-uint32_t browserComboStartedAt = 0;
-bool browserComboTriggered = false;
+volatile uint32_t browserPressMillis = 0;
 bool playModifierUsed = false;
 bool playClickPending = false;
+bool wifiApEnabled = false;
 uint32_t lastPlayReleaseMillis = 0;
+uint32_t lastWifiSwitchPollMillis = 0;
 unsigned long lastButtonMillis = 0;
 SemaphoreHandle_t audioMutex;
 SemaphoreHandle_t stateMutex;
@@ -166,6 +173,33 @@ void IRAM_ATTR handlePlayISR() {
 	}
 }
 
+void IRAM_ATTR handleBrowserISR() {
+	if (digitalRead(BROWSER_BUTTON_PIN) == LOW) {
+		browserPressed = true;
+		browserPressMillis = millis();
+	} else {
+		browserReleased = true;
+	}
+}
+
+void applyWifiHardwareState(bool enabled) {
+	if (enabled == wifiApEnabled) return;
+	wifiApEnabled = enabled;
+	if (wifiApEnabled) {
+		WiFi.mode(WIFI_AP);
+		WiFi.softAP(configuredSsid.c_str(), configuredPassword.c_str());
+		Serial.print("Wi-Fi AP: ");
+		Serial.println(configuredSsid);
+		Serial.print("AP IP: ");
+		Serial.println(WiFi.softAPIP());
+	} else {
+		WiFi.softAPdisconnect(true);
+		WiFi.mode(WIFI_OFF);
+		Serial.println("Wi-Fi AP OFF");
+	}
+	displayDirty = true;
+}
+
 void setScreen(Screen nextScreen) {
 	if (currentScreen == nextScreen) return;
 	previousScreen = currentScreen;
@@ -173,6 +207,37 @@ void setScreen(Screen nextScreen) {
 	screenTransitionStart = millis();
 	uiStateChangeMillis = millis();
 	displayDirty = true;
+}
+
+String decodeUrlComponent(const String &value) {
+	String decoded;
+	decoded.reserve(value.length());
+	for (size_t index = 0; index < value.length(); ++index) {
+		char character = value[index];
+		if (character == '+') {
+			decoded += ' ';
+			continue;
+		}
+		if (character == '%' && index + 2 < value.length()) {
+			char high = value[index + 1];
+			char low = value[index + 2];
+			bool valid = ((high >= '0' && high <= '9') || (high >= 'A' && high <= 'F') || (high >= 'a' && high <= 'f')) &&
+				((low >= '0' && low <= '9') || (low >= 'A' && low <= 'F') || (low >= 'a' && low <= 'f'));
+			if (valid) {
+				char hex[3] = {high, low, '\0'};
+				decoded += static_cast<char>(strtol(hex, nullptr, 16));
+				index += 2;
+				continue;
+			}
+		}
+		decoded += character;
+	}
+	return decoded;
+}
+
+String getDecodedPathArg(const String &name) {
+	String rawValue = webServer.hasArg(name) ? webServer.arg(name) : "";
+	return decodeUrlComponent(rawValue);
 }
 
 String joinPath(const String &base, const String &name) {
@@ -829,9 +894,10 @@ const char remotePage[] PROGMEM = R"HTML(
     <div id="files">Loading&hellip;</div>
 
     <div class="uploadrow">
-      <form id="uploadForm" style="display:flex;flex:1;gap:8px">
+      <form id="uploadForm" style="display:flex;flex:1;gap:8px;align-items:center;flex-wrap:wrap">
         <input id="uploadFile" type="file" accept=".mp3,audio/mpeg">
         <button type="submit">Upload</button>
+        <span id="uploadStatus" style="font-size:12px;opacity:0.8"></span>
       </form>
     </div>
 
@@ -863,7 +929,7 @@ function parentPath(path){if(path==='/')return '/';let i=path.lastIndexOf('/');r
 const listContainer=document.querySelector('#files');
 async function loadFiles(path){filesPath=path||'/';let entries=await (await fetch('/files?path='+encodeURIComponent(filesPath))).json();document.querySelector('#filesPath').textContent=filesPath;listContainer.replaceChildren();entries.forEach(e=>{const full=e.name==='..'?parentPath(filesPath):(filesPath==='/'?'/'+e.name:filesPath+'/'+e.name);const el=document.createElement('div');el.className='file';el.dataset.path=full;el.dataset.isDir=e.isDirectory?'1':'0';const name=document.createElement('span');name.className='file-name';name.textContent=(e.isDirectory?'[D] ':'')+e.name;el.appendChild(name);if(!e.isDirectory){const actions=document.createElement('div');actions.className='file-actions';for(const action of ['play','download','delete']){const button=document.createElement('button');button.dataset.action=action;button.dataset.path=full;button.dataset.name=e.name;button.textContent=action[0].toUpperCase()+action.slice(1);actions.appendChild(button)}el.appendChild(actions)}listContainer.appendChild(el)});if(!entries.length)listContainer.textContent='Empty'}
 listContainer.addEventListener('click',async(event)=>{const action=event.target.dataset.action;const path=event.target.dataset.path;if(action){if(action==='play')await post('/playFile?path='+encodeURIComponent(path));if(action==='download')window.location.href='/download?path='+encodeURIComponent(path);if(action==='delete'&&confirm('Na pewno usunąć '+event.target.dataset.name+'?')){await post('/delete?path='+encodeURIComponent(path));loadFiles(filesPath)}return}const el=event.target.closest('[data-path]');if(el&&el.dataset.isDir==='1'){loadFiles(el.dataset.path)}});
-document.querySelector('#uploadForm').addEventListener('submit',async(event)=>{event.preventDefault();const file=document.querySelector('#uploadFile').files[0];if(!file)return;const form=new FormData();form.append('path',filesPath);form.append('file',file);await fetch('/upload?path='+encodeURIComponent(filesPath),{method:'POST',body:form});loadFiles(filesPath)});
+document.querySelector('#uploadForm').addEventListener('submit',async(event)=>{event.preventDefault();const file=document.querySelector('#uploadFile').files[0];if(!file)return;const status=document.querySelector('#uploadStatus');const form=new FormData();form.append('path',filesPath);form.append('file',file);const xhr=new XMLHttpRequest();xhr.open('POST','/upload?path='+encodeURIComponent(filesPath),true);xhr.upload.onprogress=(progressEvent)=>{const pct=progressEvent.lengthComputable?Math.round((progressEvent.loaded/progressEvent.total)*100):0;status.textContent='Uploading: '+pct+'%';};xhr.onload=()=>{if(xhr.status>=200&&xhr.status<300){status.textContent='Upload complete';loadFiles(filesPath);}else{const msg=(xhr.responseText||xhr.statusText||'Upload failed');status.textContent='Upload failed';alert('Upload failed: '+msg);}};xhr.onerror=()=>{status.textContent='Upload failed';alert('Upload failed');};xhr.send(form);});
 async function makeFolder(){const name=document.querySelector('#newFolder').value.trim();if(name)await post('/mkdir?path='+encodeURIComponent((filesPath==='/'?'':filesPath)+'/'+name));loadFiles(filesPath)}
 async function loadConfig(){const c=await (await fetch('/config')).json();document.querySelector('#ssid').value=c.ssid;}
 document.querySelector('#configForm').addEventListener('submit',async(event)=>{event.preventDefault();await fetch('/config',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:'ssid='+encodeURIComponent(document.querySelector('#ssid').value)+'&password='+encodeURIComponent(document.querySelector('#password').value)});alert('Restarting AP');});
@@ -918,7 +984,8 @@ void sendPlayerStatus() {
 	String json = "{\"track\":\"" + jsonEscape(track) + "\",\"position\":" + String(displayPosition) +
 		",\"duration\":" + String(duration) + ",\"volume\":" + String(volume) +
 		",\"paused\":" + String(paused ? "true" : "false") + ",\"mode\":\"" + mode +
-		"\",\"positionText\":\"" + formatTime(displayPosition) + "\",\"durationText\":\"" + formatTime(duration) + "\"}";
+		"\",\"wifiEnabled\":" + String(wifiApEnabled ? "true" : "false") +
+		",\"positionText\":\"" + formatTime(displayPosition) + "\",\"durationText\":\"" + formatTime(duration) + "\"}";
 	webServer.send(200, "application/json", json);
 }
 
@@ -977,13 +1044,13 @@ void webMode() {
 }
 
 void webPlayFile() {
-	String path = webServer.hasArg("path") ? webServer.arg("path") : "";
+	String path = getDecodedPathArg("path");
 	bool played = path.startsWith("/") && path.indexOf("..") < 0 && playFileFromPath(path);
 	webServer.send(played ? 200 : 404, "text/plain", played ? "OK" : "File not found");
 }
 
 void webDelete() {
-	String path = webServer.hasArg("path") ? webServer.arg("path") : "";
+	String path = getDecodedPathArg("path");
 	if (!path.startsWith("/") || path.indexOf("..") >= 0) {
 		webServer.send(400, "text/plain", "Invalid path");
 		return;
@@ -1002,38 +1069,123 @@ void webDelete() {
 }
 
 void webMkdir() {
-	String path = webServer.hasArg("path") ? webServer.arg("path") : "";
+	String path = getDecodedPathArg("path");
 	if (!path.startsWith("/") || path.indexOf("..") >= 0 || path == "/") {
 		webServer.send(400, "text/plain", "Invalid path");
 		return;
 	}
-	xSemaphoreTake(sdMutex, portMAX_DELAY);
-	bool created = SD.mkdir(path.c_str());
-	xSemaphoreGive(sdMutex);
-	webServer.send(created ? 200 : 409, "text/plain", created ? "OK" : "Unable to create folder");
+	if (xSemaphoreTake(sdMutex, pdMS_TO_TICKS(50)) == pdTRUE) {
+		bool created = SD.mkdir(path.c_str());
+		xSemaphoreGive(sdMutex);
+		webServer.send(created ? 200 : 409, "text/plain", created ? "OK" : "Unable to create folder");
+		return;
+	}
+	webServer.send(503, "text/plain", "Busy");
 }
 
 void handleUpload(HTTPUpload &upload) {
+	static uint32_t uploadBytesTotal = 0;
+	static uint32_t lastHeapLogMillis = 0;
+	static uint32_t lastChunkLogBytes = 0;
+	static uint32_t chunkCounter = 0;
+
 	if (upload.status == UPLOAD_FILE_START) {
-		String folder = webServer.hasArg("path") ? webServer.arg("path") : "/";
+		uploadBytesTotal = 0;
+		lastHeapLogMillis = millis();
+		lastChunkLogBytes = 0;
+		chunkCounter = 0;
+		uploadFailed = false;
+		uploadTargetPath = "";
+		Serial.printf("[upload] start path=%s freeHeap=%u\n", getDecodedPathArg("path").c_str(), ESP.getFreeHeap());
+		String folder = getDecodedPathArg("path");
+		if (folder.length() == 0) folder = "/";
 		String name = upload.filename;
 		int separator = name.lastIndexOf('/');
 		if (separator >= 0) name = name.substring(separator + 1);
-		if (!folder.startsWith("/") || folder.indexOf("..") >= 0 || name.length() == 0 || name.indexOf("..") >= 0) return;
+		if (!folder.startsWith("/") || folder.indexOf("..") >= 0 || name.length() == 0 || name.indexOf("..") >= 0) {
+			uploadFailed = true;
+			Serial.println("[upload] invalid upload path");
+			return;
+		}
 		uploadTargetPath = joinPath(folder, name);
-		xSemaphoreTake(sdMutex, portMAX_DELAY);
-		SD.remove(uploadTargetPath.c_str());
-		uploadFile = SD.open(uploadTargetPath.c_str(), FILE_WRITE);
-		xSemaphoreGive(sdMutex);
-	} else if (upload.status == UPLOAD_FILE_WRITE && uploadFile) {
-		xSemaphoreTake(sdMutex, portMAX_DELAY);
-		uploadFile.write(upload.buf, upload.currentSize);
-		xSemaphoreGive(sdMutex);
-	} else if (upload.status == UPLOAD_FILE_END && uploadFile) {
-		xSemaphoreTake(sdMutex, portMAX_DELAY);
-		uploadFile.close();
-		xSemaphoreGive(sdMutex);
+		if (xSemaphoreTake(sdMutex, pdMS_TO_TICKS(200)) == pdTRUE) {
+			SD.remove(uploadTargetPath.c_str());
+			uploadFile = SD.open(uploadTargetPath.c_str(), FILE_WRITE);
+			xSemaphoreGive(sdMutex);
+			if (!uploadFile) {
+				uploadFailed = true;
+				Serial.printf("[upload] failed to open %s for write\n", uploadTargetPath.c_str());
+				return;
+			}
+		} else {
+			uploadFile = File();
+			uploadFailed = true;
+			Serial.println("[upload] ERROR: could not acquire sdMutex on start within 200ms");
+			if (!uploadTargetPath.isEmpty()) {
+				SD.remove(uploadTargetPath.c_str());
+			}
+			return;
+		}
+	} else if (upload.status == UPLOAD_FILE_WRITE && uploadFile && !uploadFailed) {
+		if (upload.currentSize > 0) {
+			if (xSemaphoreTake(sdMutex, pdMS_TO_TICKS(200)) != pdTRUE) {
+				Serial.println("[upload] ERROR: could not acquire sdMutex in 200ms during write - aborting");
+				uploadFailed = true;
+				if (uploadFile) {
+					uploadFile.close();
+				}
+				if (!uploadTargetPath.isEmpty()) {
+					SD.remove(uploadTargetPath.c_str());
+				}
+				return;
+			}
+			size_t written = uploadFile.write(upload.buf, upload.currentSize);
+			xSemaphoreGive(sdMutex);
+			if (written != upload.currentSize) {
+				Serial.printf("[upload] BŁĄD ZAPISU: żądano=%u zapisano=%u — przerywam upload\n", upload.currentSize, written);
+				uploadFailed = true;
+				if (uploadFile) {
+					uploadFile.close();
+				}
+				if (!uploadTargetPath.isEmpty()) {
+					SD.remove(uploadTargetPath.c_str());
+				}
+				return;
+			}
+			uploadBytesTotal += written;
+			chunkCounter++;
+			lastChunkLogBytes += written;
+			if (millis() - lastHeapLogMillis >= 2000) {
+				lastHeapLogMillis = millis();
+				Serial.printf("[upload] heap total=%u freeHeap=%u\n", uploadBytesTotal, ESP.getFreeHeap());
+			}
+			if ((chunkCounter % 50 == 0) || (lastChunkLogBytes >= 500 * 1024)) {
+				Serial.printf("[upload] chunkLog chunks=%u bytes=%u total=%u freeHeap=%u\n", chunkCounter, lastChunkLogBytes, uploadBytesTotal, ESP.getFreeHeap());
+				lastChunkLogBytes = 0;
+			}
+		}
+	} else if (upload.status == UPLOAD_FILE_END) {
+		Serial.printf("[upload] end total=%u expected=%u freeHeap=%u failed=%d\n", uploadBytesTotal, upload.totalSize, ESP.getFreeHeap(), uploadFailed ? 1 : 0);
+		if (uploadFile) {
+			if (xSemaphoreTake(sdMutex, pdMS_TO_TICKS(200)) == pdTRUE) {
+				uploadFile.close();
+				xSemaphoreGive(sdMutex);
+			}
+		}
+		if (uploadFailed || uploadBytesTotal != upload.totalSize || uploadBytesTotal == 0) {
+			uploadFailed = true;
+			if (!uploadTargetPath.isEmpty()) {
+				if (xSemaphoreTake(sdMutex, pdMS_TO_TICKS(200)) == pdTRUE) {
+					SD.remove(uploadTargetPath.c_str());
+					xSemaphoreGive(sdMutex);
+				}
+			}
+			Serial.println("[upload] upload failed and temporary file was removed");
+		}
+		uploadFile = File();
+		uploadTargetPath = "";
 	}
+	yield();
 }
 
 void handleUploadRequest() {
@@ -1041,7 +1193,13 @@ void handleUploadRequest() {
 }
 
 void uploadComplete() {
+	if (uploadFailed) {
+		webServer.send(500, "text/plain", "Upload failed - incomplete write");
+		uploadFailed = false;
+		return;
+	}
 	webServer.send(200, "text/plain", "OK");
+	uploadFailed = false;
 }
 
 void webConfigGet() {
@@ -1085,7 +1243,8 @@ void webSeek() {
 }
 
 void webFiles() {
-	String path = webServer.hasArg("path") ? webServer.arg("path") : "/";
+	String path = getDecodedPathArg("path");
+	if (path.length() == 0) path = "/";
 	if (!path.startsWith("/")) path = "/" + path;
 	if (!scanDirectory(path.c_str())) {
 		webServer.send(404, "application/json", "{\"error\":\"directory not found\"}");
@@ -1105,17 +1264,21 @@ void webFiles() {
 }
 
 void webDownload() {
-	String path = webServer.hasArg("path") ? webServer.arg("path") : "";
+	String path = getDecodedPathArg("path");
 	if (!path.startsWith("/") || path.indexOf("..") >= 0) {
 		webServer.send(400, "text/plain", "Invalid path");
 		return;
 	}
 
-	xSemaphoreTake(sdMutex, portMAX_DELAY);
-	File download = SD.open(path.c_str(), FILE_READ);
-	bool validFile = download && !download.isDirectory();
-	uint32_t fileSize = validFile ? static_cast<uint32_t>(download.size()) : 0;
-	xSemaphoreGive(sdMutex);
+	File download;
+	bool validFile = false;
+	uint32_t fileSize = 0;
+	if (xSemaphoreTake(sdMutex, pdMS_TO_TICKS(50)) == pdTRUE) {
+		download = SD.open(path.c_str(), FILE_READ);
+		validFile = download && !download.isDirectory();
+		fileSize = validFile ? static_cast<uint32_t>(download.size()) : 0;
+		xSemaphoreGive(sdMutex);
+	}
 	if (!validFile) {
 		webServer.send(404, "text/plain", "File not found");
 		return;
@@ -1142,12 +1305,6 @@ void webDownload() {
 }
 
 void setupWebServer() {
-	WiFi.mode(WIFI_AP);
-	WiFi.softAP(configuredSsid.c_str(), configuredPassword.c_str());
-	Serial.print("Wi-Fi AP: ");
-	Serial.println(WIFI_AP_SSID);
-	Serial.print("AP IP: ");
-	Serial.println(WiFi.softAPIP());
 	webServer.on("/", HTTP_GET, []() { webServer.send_P(200, "text/html", remotePage); });
 	webServer.on("/status", HTTP_GET, sendPlayerStatus);
 	webServer.on("/play", HTTP_POST, webPlay);
@@ -1170,9 +1327,24 @@ void setupWebServer() {
 
 void wifiTask(void *parameter) {
 	(void)parameter;
+	bool wifiSwitchState = digitalRead(WIFI_SWITCH_PIN) == LOW;
+	wifiApEnabled = wifiSwitchState;
+	if (wifiApEnabled) {
+		WiFi.mode(WIFI_AP);
+		WiFi.softAP(configuredSsid.c_str(), configuredPassword.c_str());
+		Serial.print("Wi-Fi AP: ");
+		Serial.println(configuredSsid);
+		Serial.print("AP IP: ");
+		Serial.println(WiFi.softAPIP());
+	}
 	setupWebServer();
 	for (;;) {
+		bool switchState = digitalRead(WIFI_SWITCH_PIN) == LOW;
+		if (switchState != wifiApEnabled) {
+			applyWifiHardwareState(switchState);
+		}
 		webServer.handleClient();
+		yield();
 		vTaskDelay(pdMS_TO_TICKS(2));
 	}
 }
@@ -1277,14 +1449,23 @@ void audioFeedTask(void *parameter) {
 void drawNowPlaying() {
 	uint32_t now = millis();
 	String title;
-	size_t trackIndex;
-	xSemaphoreTake(stateMutex, portMAX_DELAY);
-	trackIndex = currentTrack;
-	title = tracks.empty() ? String("Brak utworu") : tracks[currentTrack];
-	xSemaphoreGive(stateMutex);
-	xSemaphoreTake(audioMutex, portMAX_DELAY);
-	bool paused = playbackPaused || playbackStopped;
-	xSemaphoreGive(audioMutex);
+	size_t trackIndex = 0;
+	bool paused = false;
+	float displayGain = currentGain;
+	if (xSemaphoreTake(stateMutex, pdMS_TO_TICKS(20)) == pdTRUE) {
+		trackIndex = currentTrack;
+		title = tracks.empty() ? String("Brak utworu") : tracks[currentTrack];
+		xSemaphoreGive(stateMutex);
+	} else {
+		return;
+	}
+	if (xSemaphoreTake(audioMutex, pdMS_TO_TICKS(20)) == pdTRUE) {
+		paused = playbackPaused || playbackStopped;
+		displayGain = currentGain;
+		xSemaphoreGive(audioMutex);
+	} else {
+		paused = false;
+	}
 	int separator = title.lastIndexOf('/');
 	if (separator >= 0) title = title.substring(separator + 1);
 
@@ -1302,9 +1483,6 @@ void drawNowPlaying() {
 	if (durationSec == 0) durationSec = 1;
 	uint32_t displayPosition = min(positionSec, durationSec);
 	float progress = min(1.0f, static_cast<float>(positionSec) / durationSec);
-	xSemaphoreTake(audioMutex, portMAX_DELAY);
-	float displayGain = currentGain;
-	xSemaphoreGive(audioMutex);
 	int titleWidth = u8g2.getUTF8Width(title.c_str());
 	int titleX = 0;
 	if (titleWidth > 128) {
@@ -1385,8 +1563,24 @@ void drawNowPlaying() {
 
 void drawBrowser() {
 	uint32_t now = millis();
+	String header = "/";
+	size_t selection = 0;
+	size_t offset = 0;
+	std::vector<DirectoryEntry> entries;
+	if (xSemaphoreTake(stateMutex, pdMS_TO_TICKS(20)) == pdTRUE) {
+		header = currentDirectory;
+		selection = browserSelection;
+		offset = browserOffset;
+		xSemaphoreGive(stateMutex);
+	}
+	if (xSemaphoreTake(sdMutex, pdMS_TO_TICKS(20)) == pdTRUE) {
+		entries = directoryEntries;
+		xSemaphoreGive(sdMutex);
+	} else {
+		return;
+	}
 	static float highlightRow = 0.0f;
-	float targetRow = static_cast<float>(browserSelection - browserOffset);
+	float targetRow = static_cast<float>(selection - offset);
 	if (!UI_ANIMATIONS) highlightRow = targetRow;
 	else highlightRow += (targetRow - highlightRow) * min(1.0f, (now % 1000) / 120.0f);
 	if (highlightRow < 0) highlightRow = 0;
@@ -1394,14 +1588,13 @@ void drawBrowser() {
 
 	u8g2.clearBuffer();
 	u8g2.setFont(u8g2_font_6x10_tf);
-	String header = currentDirectory;
 	if (header.length() > 20) header = header.substring(header.length() - 20);
 	u8g2.drawStr(0, 9, header.c_str());
 	u8g2.drawHLine(0, 11, 128);
 
 	for (size_t row = 0; row < 4; ++row) {
-		size_t index = browserOffset + row;
-		if (index >= directoryEntries.size()) break;
+		size_t index = offset + row;
+		if (index >= entries.size()) break;
 		int baseline = 21 + static_cast<int>(row) * 11;
 		if (static_cast<int>(row) == static_cast<int>(highlightRow + 0.5f)) {
 			u8g2.setDrawColor(1);
@@ -1409,7 +1602,7 @@ void drawBrowser() {
 			u8g2.setDrawColor(0);
 		}
 
-		DirectoryEntry entry = directoryEntries[index];
+		DirectoryEntry entry = entries[index];
 		String label = entry.isParent ? ".." : (entry.isDirectory ? "[D] " : "    ") + entry.name;
 		if (label.length() > 20) label = label.substring(0, 20);
 		u8g2.drawStr(0, baseline, label.c_str());
@@ -1464,7 +1657,7 @@ void fail() {
 }
 
 void setup() {
-	Serial.begin(9600);
+	Serial.begin(115200);
 	Serial.println("MP3 player - BackgroundAudioMP3 example");
 	preferences.begin("vistream", false);
 	configuredSsid = preferences.isKey("wifiSsid") ? preferences.getString("wifiSsid") : WIFI_AP_SSID;
@@ -1555,29 +1748,42 @@ void setup() {
 	pinMode(NEXT_BUTTON_PIN, INPUT_PULLUP);
 	pinMode(PREV_BUTTON_PIN, INPUT_PULLUP);
 	pinMode(PLAY_BUTTON_PIN, INPUT_PULLUP);
+	pinMode(WIFI_SWITCH_PIN, INPUT_PULLUP);
+	pinMode(BROWSER_BUTTON_PIN, INPUT_PULLUP);
 	attachInterrupt(digitalPinToInterrupt(NEXT_BUTTON_PIN), handleNextISR, CHANGE);
 	attachInterrupt(digitalPinToInterrupt(PREV_BUTTON_PIN), handlePrevISR, CHANGE);
 	attachInterrupt(digitalPinToInterrupt(PLAY_BUTTON_PIN), handlePlayISR, CHANGE);
+	attachInterrupt(digitalPinToInterrupt(BROWSER_BUTTON_PIN), handleBrowserISR, CHANGE);
 }
 
 void loop() {
+	yield();
 	unsigned long now = millis();
 	if (now - lastBatterySampleMillis >= BATTERY_SAMPLE_INTERVAL_MS) {
 		lastBatterySampleMillis = now;
 		updateBatteryVoltage();
 	}
-	bool nextHeld = digitalRead(NEXT_BUTTON_PIN) == LOW;
-	bool prevHeld = digitalRead(PREV_BUTTON_PIN) == LOW;
-	if (nextHeld && prevHeld) {
-		if (browserComboStartedAt == 0) browserComboStartedAt = now;
-		if (!browserComboTriggered && now - browserComboStartedAt >= 500) {
-			Serial.println("Next+Prev: powrót do przeglądarki");
-			enterBrowser();
-			browserComboTriggered = true;
+
+	if (now - lastWifiSwitchPollMillis >= WIFI_SWITCH_POLL_MS) {
+		lastWifiSwitchPollMillis = now;
+		bool wifiSwitchState = digitalRead(WIFI_SWITCH_PIN) == LOW;
+		if (wifiSwitchState != wifiApEnabled) {
+			applyWifiHardwareState(wifiSwitchState);
 		}
-	} else if (!nextHeld && !prevHeld) {
-		browserComboStartedAt = 0;
-		browserComboTriggered = false;
+	}
+
+	if (browserReleased && browserPressed) {
+		browserReleased = false;
+		browserPressed = false;
+		if (now - lastButtonMillis > 300) {
+			lastButtonMillis = now;
+			if (currentScreen == SCREEN_BROWSER) {
+				setScreen(SCREEN_NOWPLAYING);
+				displayDirty = true;
+			} else {
+				enterBrowser();
+			}
+		}
 	}
 
 	if (nextReleased && nextPressed) {
