@@ -44,6 +44,22 @@
 #define WIFI_AP_SSID "vistream32"
 #define WIFI_AP_PASSWORD "vistream1234"
 
+// --- Ikony 8x8 (XBM) ---
+static const unsigned char icon_folder[] PROGMEM = {
+    0x0E, 0x7F, 0x81, 0x81, 0x81, 0x81, 0xFF, 0x00
+};
+static const unsigned char icon_note[] PROGMEM = {
+    0x60, 0x60, 0x60, 0x60, 0x66, 0x6F, 0x0F, 0x00
+};
+static const unsigned char icon_back[] PROGMEM = {
+    0x08, 0x0C, 0x7E, 0xFF, 0xFF, 0x7E, 0x0C, 0x08
+};
+
+// Kalibracja procentu baterii do wyświetlania (dopasuj pod realne napięcia)
+constexpr float BATTERY_DISPLAY_FULL_V  = 4.2f;
+constexpr float BATTERY_DISPLAY_EMPTY_V = 3.2f;
+
+
 enum RepeatMode : uint8_t {
 	REPEAT_OFF,
 	REPEAT_ONE,
@@ -1450,10 +1466,12 @@ void drawNowPlaying() {
 	uint32_t now = millis();
 	String title;
 	size_t trackIndex = 0;
+	size_t trackCount = 0;
 	bool paused = false;
 	float displayGain = currentGain;
 	if (xSemaphoreTake(stateMutex, pdMS_TO_TICKS(20)) == pdTRUE) {
 		trackIndex = currentTrack;
+		trackCount = tracks.size();
 		title = tracks.empty() ? String("Brak utworu") : tracks[currentTrack];
 		xSemaphoreGive(stateMutex);
 	} else {
@@ -1483,6 +1501,59 @@ void drawNowPlaying() {
 	if (durationSec == 0) durationSec = 1;
 	uint32_t displayPosition = min(positionSec, durationSec);
 	float progress = min(1.0f, static_cast<float>(positionSec) / durationSec);
+
+	u8g2.clearBuffer();
+
+	// --- Pasek statusu (góra) ---
+	u8g2.setFont(u8g2_font_5x7_tf);
+	char counterText[12];
+	snprintf(counterText, sizeof(counterText), "%02u/%02u",
+			static_cast<unsigned>(trackIndex + 1), static_cast<unsigned>(max((size_t)1, trackCount)));
+	u8g2.drawStr(0, 7, counterText);
+
+	int badgeX = 128;
+	// Plakietka trybu (shuffle/repeat) jako odwrócony box, wyrównana do prawej
+	const char* modeLabel = nullptr;
+	if (shuffleEnabled) modeLabel = "S";
+	else if (repeatMode == REPEAT_ONE) modeLabel = "R1";
+	else if (repeatMode == REPEAT_ALL) modeLabel = "RA";
+	if (modeLabel) {
+		int labelWidth = u8g2.getStrWidth(modeLabel);
+		int boxWidth = labelWidth + 4;
+		badgeX -= boxWidth;
+		u8g2.drawRBox(badgeX, 0, boxWidth, 8, 1);
+		u8g2.setDrawColor(0);
+		u8g2.drawStr(badgeX + 2, 7, modeLabel);
+		u8g2.setDrawColor(1);
+		badgeX -= 3;
+	}
+
+	// Ikona Wi-Fi (fale) — tylko gdy klient połączony
+	if (isWifiClientConnected()) {
+		badgeX -= 11;
+		u8g2.drawCircle(badgeX + 4, 4, 1);
+		u8g2.drawCircle(badgeX + 4, 4, 3);
+		badgeX -= 3;
+	}
+
+	// Ikona baterii — realny procent wypełnienia, miga tylko gdy niski poziom
+	bool batteryLow = batteryVoltage < BATTERY_WARNING_VOLTAGE;
+	bool blinkOff = batteryLow && ((now / 500) % 2 == 0);
+	if (!blinkOff) {
+		badgeX -= 15;
+		int bx = badgeX;
+		u8g2.drawFrame(bx, 1, 12, 6);
+		u8g2.drawBox(bx + 12, 2, 2, 4);
+		float pct = constrain((batteryVoltage - BATTERY_DISPLAY_EMPTY_V) /
+				(BATTERY_DISPLAY_FULL_V - BATTERY_DISPLAY_EMPTY_V), 0.0f, 1.0f);
+		int fillWidth = static_cast<int>(pct * 10);
+		if (fillWidth > 0) u8g2.drawBox(bx + 1, 2, fillWidth, 4);
+	}
+
+	u8g2.drawHLine(0, 10, 128);
+
+	// --- Tytuł (pogrubiony, większy) ---
+	u8g2.setFont(u8g2_font_7x13B_tf);  // jeśli brak w wersji u8g2, zamień na u8g2_font_helvB08_tr
 	int titleWidth = u8g2.getUTF8Width(title.c_str());
 	int titleX = 0;
 	if (titleWidth > 128) {
@@ -1497,67 +1568,60 @@ void drawNowPlaying() {
 		}
 		titleX = -marqueeOffset;
 	}
-
-	u8g2.clearBuffer();
-	u8g2.setFont(u8g2_font_6x10_tf);
-	u8g2.drawStr(0, 10, "Now Playing");
-	if (shuffleEnabled) {
-		u8g2.drawStr(102, 10, "S");
-	} else if (repeatMode == REPEAT_ONE) {
-		u8g2.drawStr(96, 10, "R1");
-	} else if (repeatMode == REPEAT_ALL) {
-		u8g2.drawStr(94, 10, "RA");
-	}
-	if (batteryVoltage < BATTERY_WARNING_VOLTAGE && ((now / 500) % 2 == 0)) {
-		u8g2.drawFrame(112, 2, 13, 7);
-		u8g2.drawBox(125, 4, 2, 3);
-	} else {
-		u8g2.drawFrame(112, 2, 13, 7);
-		u8g2.drawBox(125, 4, 2, 3);
-	}
-	u8g2.drawHLine(0, 13, 128);
 	if (titleWidth <= 128) {
-		u8g2.drawUTF8(0, 23, title.c_str());
+		u8g2.drawUTF8(0, 26, title.c_str());
 	} else {
-		u8g2.drawUTF8(titleX, 23, title.c_str());
-		if (marqueeOffset >= titleWidth) u8g2.drawUTF8(128, 23, title.c_str());
+		u8g2.drawUTF8(titleX, 26, title.c_str());
+		if (marqueeOffset >= titleWidth) u8g2.drawUTF8(128, 26, title.c_str());
 	}
-	u8g2.drawFrame(0, 27, 128, 6);
-	u8g2.drawBox(1, 28, max(1, static_cast<int>(126 * progress)), 4);
+
+	// --- Pasek postępu ze "scrubberem" ---
+	u8g2.setFont(u8g2_font_5x7_tf);
+	u8g2.drawRFrame(0, 32, 128, 6, 2);
+	int fillW = max(2, static_cast<int>(124 * progress));
+	u8g2.drawRBox(2, 34, fillW, 2, 1);
+	int scrubberX = 2 + fillW;
+	u8g2.drawDisc(min(126, scrubberX), 35, 2);
+
 	char timeText[20];
 	snprintf(timeText, sizeof(timeText), "%02lu:%02lu / %02lu:%02lu",
 			displayPosition / 60, displayPosition % 60, durationSec / 60, durationSec % 60);
-	u8g2.drawStr(0, 42, timeText);
+	int timeWidth = u8g2.getStrWidth(timeText);
+	u8g2.drawStr((128 - timeWidth) / 2, 46, timeText);
 
-	uint32_t iconElapsed = now - uiStateChangeMillis;
-	uint8_t iconSize = UI_ANIMATIONS ? min(8UL, 4UL + iconElapsed / 60) : 8;
+	// --- Dolny wiersz: play/pause + equalizer z peak-hold ---
+	u8g2.drawCircle(9, 55, 8);
 	if (paused) {
-		u8g2.drawBox(7, 48, 3, iconSize);
-		u8g2.drawBox(14, 48, 3, iconSize);
+		u8g2.drawBox(6, 51, 2, 8);
+		u8g2.drawBox(10, 51, 2, 8);
 	} else {
-		u8g2.drawTriangle(7, 48, 7, 48 + iconSize, 7 + iconSize, 48 + iconSize / 2);
+		u8g2.drawTriangle(6, 50, 6, 60, 14, 55);
 	}
 
 	if (!paused && UI_ANIMATIONS) {
+		static float peaks[5] = {0, 0, 0, 0, 0};
 		for (uint8_t bar = 0; bar < 5; ++bar) {
 			uint8_t height = 4 + ((now / 140 + bar * 3) % 10);
-			u8g2.drawBox(42 + bar * 6, 60 - height, 4, height);
+			int barX = 46 + bar * 12;
+			u8g2.drawBox(barX, 62 - height, 6, height);
+			if (height > peaks[bar]) peaks[bar] = height;
+			else peaks[bar] = max(0.0f, peaks[bar] - 0.3f);
+			u8g2.drawHLine(barX, 62 - static_cast<int>(peaks[bar]) - 1, 6);
 		}
 	}
-	if (isWifiClientConnected()) {
-		u8g2.drawCircle(118, 57, 2);
-		u8g2.drawCircle(118, 57, 6);
-		u8g2.drawCircle(118, 57, 9);
-	}
+
 	if (static_cast<int32_t>(volumeOverlayUntil - now) > 0) {
 		char volumeText[16];
 		snprintf(volumeText, sizeof(volumeText), "Vol: %d%%", static_cast<int>(displayGain * 100.0f / MAX_GAIN));
 		u8g2.setDrawColor(0);
-		u8g2.drawBox(52, 44, 76, 18);
+		u8g2.drawRBox(30, 44, 68, 16, 2);
 		u8g2.setDrawColor(1);
-		u8g2.drawFrame(52, 44, 76, 18);
-		u8g2.drawStr(58, 56, volumeText);
+		u8g2.drawRFrame(30, 44, 68, 16, 2);
+		u8g2.setFont(u8g2_font_6x10_tf);
+		int vw = u8g2.getStrWidth(volumeText);
+		u8g2.drawStr(30 + (68 - vw) / 2, 55, volumeText);
 	}
+
 	u8g2.sendBuffer();
 }
 
@@ -1613,12 +1677,17 @@ void drawBrowser() {
 
 void drawSplash(uint32_t now) {
 	u8g2.clearBuffer();
-	u8g2.setFont(u8g2_font_6x10_tf);
-	u8g2.drawStr(29, 22, "vistream32");
-	u8g2.drawFrame(14, 35, 100, 8);
+	u8g2.setFont(u8g2_font_9x15B_tr);  // jeśli brak, zamień na u8g2_font_7x13B_tf
+	int textWidth = u8g2.getStrWidth("vistream32");
+	u8g2.drawStr((128 - textWidth) / 2, 24, "vistream32");
+
+	u8g2.setFont(u8g2_font_5x7_tf);
+	u8g2.drawStr(35, 34, "loading player");
+
+	u8g2.drawRFrame(14, 42, 100, 8, 2);
 	uint8_t width = static_cast<uint8_t>(min(96UL, static_cast<uint32_t>(splashProgress) * 96 / 100));
 	if (UI_ANIMATIONS) width = max(width, static_cast<uint8_t>((now / 80) % 97));
-	u8g2.drawBox(16, 37, width, 4);
+	if (width > 2) u8g2.drawRBox(16, 44, width, 4, 1);
 	u8g2.sendBuffer();
 }
 

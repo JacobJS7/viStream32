@@ -1,0 +1,2 @@
+jak nikt nie wybierze folderu to niech wróci do ekranu odtwarzacza z tą samą piosenką na której się znajduje aktualnie
+

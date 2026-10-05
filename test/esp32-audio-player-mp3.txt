@@ -1,0 +1,107 @@
+Projekt vistream32 - player audio 32bit zaawansowany
+
+
+Podstawowe funkcje odtwarzacza (Audio Core)
+Odtwarzanie (Play): Uruchamianie wybranego utworu.
+Pauza (Pause): Zatrzymywanie odtwarzania z zachowaniem pozycji w utworze.
+Stop: Całkowite zatrzymanie odtwarzania i powrót na początek utworu.
+Następny utwór (Next): Przejście do kolejnego pliku na liście.
+Poprzedni utwór (Prev): Przejście do poprzedniego pliku.
+Szybkie przewijanie w przód (Fast Forward): Przewijanie wewnątrz odtwarzanego utworu (np. skok o 10 sekund).
+Szybkie przewijanie w tył (Rewind): Cofanie wewnątrz odtwarzanego utworu.
+Głośniej (Volume Up): Zwiększanie poziomu głośności.
+Ciszej (Volume Down): Zmniejszanie poziomu głośności.
+Wyciszenie (Mute): Natychmiastowe wyciszenie dźwięku jednym kliknięciem/akcją.
+
+
+Zarządzanie kolejką i trybami odtwarzania
+Tryb losowy (Shuffle): Odtwarzanie utworów z folderu/playlisty w losowej kolejności bez powtórzeń.
+Powtarzanie jednego utworu (Repeat One): Zapętlenie obecnie odtwarzanej piosenki.
+Powtarzanie całej listy (Repeat All): Zapętlenie całego folderu/playlisty.
+Odtwarzanie ciągłe (Normal/Continuous): Zatrzymanie odtwarzacza po zakończeniu ostatniego utworu w folderze.
+Automatyczne przejście: Samoczynne włączanie kolejnego utworu po zakończeniu poprzedniego.
+
+
+Menu i nawigacja na ekranie lokalnym (OLED UI)
+Przeglądarka plików i folderów: Możliwość chodzenia po drzewie katalogów karty SD.
+Wybór folderu jako playlisty: Zatwierdzenie katalogu i załadowanie jego zawartości do kolejki.
+Wybór konkretnego utworu: Uruchomienie wybranej piosenki z listy w folderze.
+Ekran główny odtwarzania (Now Playing): Wyświetlanie aktualnego stanu (ikona play/pauza, tryb odtwarzania).
+Wyświetlanie tytułu: Przewijanie długich nazw (efekt Marquee), jeśli nie mieszczą się na ekranie.
+Pasek postu (Progress Bar): Wizualny pasek pokazujący czas, który upłynął, oraz całkowitą długość utworu (np. 01:23 / 03:45).
+Wskaźnik głośności: Graficzny pasek lub wartość liczbowa (np. Vol: 80%).
+Wskaźnik baterii: Wyświetlanie ikony baterii lub procentu/napięcia na ekranie głównym.
+Status Wi-Fi: Ikona pokazująca, czy sieć AP jest włączona, wyłączona lub czy ktoś jest połączony.
+
+
+
+Funkcje strony internetowej (Web GUI przez Wi-Fi AP)
+Zdalny pilot: Przyciski Play, Pause, Next, Prev, Volume, Slider postępu piosenki na ekranie telefonu/komputera.
+Menedżer plików (File Explorer): Listowanie zawartości karty SD w przeglądarce.
+Wgrywanie plików (Upload): Przesyłanie piosenek z telefonu/komputera na kartę SD w urządzeniu.
+Pobieranie plików (Download): Możliwość ściągnięcia piosenki z urządzenia na telefon.
+Tworzenie folderów: Tworzenie nowych katalogów na karcie SD z poziomu przeglądarki.
+Usuwanie plików i folderów: Czyszczenie karty SD bez jej wyciągania.
+Zmiana nazw plików (Rename): Edycja nazw utworów i folderów przez stronę WWW.
+Włącznik/Wyłącznik Wi-Fi: Możliwość uśpienia modułu bezprzewodowego z poziomu strony w celu oszczędzania baterii.
+Panel konfiguracji: Zmiana nazwy sieci AP (SSID) oraz hasła dostępu.
+
+
+Zarządzanie zasilaniem i systemem (Power & System)
+Włączanie / Wyłączanie fizyczne: Główny przełącznik odcinający zasilanie.
+Pomiar napięcia baterii (ADC): Ciągły monitoring stanu naładowania akumulatora w tle.
+Ostrzeżenie o niskim stanie baterii: Komunikat na ekranie (np. "Battery Low!") lub sygnał dźwiękowy przy krytycznym poziomie.
+Automatyczne bezpieczne wyłączenie: Odcięcie funkcji lub przejście w Deep Sleep przy napięciu <3.2V, by chronić ogniwo Li-Ion.
+Sygnalizacja ładowania: Dioda LED informująca o podłączeniu ładowarki i zakończeniu ładowania.
+Zapamiętywanie stanu (Persistence): Automatyczny zapis do pamięci flash: ostatniej głośności, trybu shuffle, ostatniego folderu i utworu oraz dokładnej sekundy, na której wyłączono urządzenie.
+Automatyczne uśpienie (Auto Sleep): Wyłączenie ekranu lub przejście w tryb czuwania po X minutach bezczynności (gdy muzyka nie gra).
+
+
+Funkcje Audio Hardware (Sprzętowe)
+Automatyczne przełączanie wyjść: Odłączanie wbudowanego głośnika po wpięciu słuchawek do gniazda Jack.
+Wyciszanie trzasków (Anti-Pop): Programowe lub sprzętowe wyciszenie linii audio podczas włączania i resetowania urządzenia, aby uniknąć głośnego "strzału" w głośnikach.
+Cyfrowa regulacja głośności: Kontrola wzmocnienia realizowana bezpośrednio w rejestrach układu PCM5102A lub programowo przed wysłaniem na I2S.
+
+
+
+Obsługa sytuacji awaryjnych (Error Handling)Wykrywanie braku karty SD: Komunikat "No SD Card" i zablokowanie funkcji odtwarzacza.Wykrywanie uszkodzonych plików: Pomijanie plików, których kodek nie jest w stanie zdekodować, zamiast zawieszenia systemu.Obsługa odłączenia karty w locie: Bezpieczne przerwanie operacji zapisu/odczytu w przypadku nagłego wyciągnięcia karty SD.
+
+
+
+
+-nazwa piosenki wyswietlać na ekranie
+
+
+
+-Zapisywanie stanu (Memory Persistence): Pominąłeś funkcję zapamiętywania ostatnio odtwarzanego utworu, pozycji w piosence oraz poziomu głośności po wyłączeniu urządzenia włącznikiem
+
+
+
+
+
+-wielowatkowosc
+--Core 0 dla Wi-Fi i karty SD, Core 1 dla dekodowania audio
+
+
+-odczytywanie volt baterii Odtwarzacz musi nie tylko pokazywać ikonkę baterii, ale też automatycznie odciąć zasilanie lub przejść w głęboki sen
+
+
+
+moduły
+-esp32
+-wyświetlacz ssd1306
+-moduł kart sd
+-moduł PCM5102A 
+-bateria
+-przyciski (play,next,prev)
+-włącznik
+-układ ładowania baterii TP4056 
+-bateria 18650 albo podobna
+-PAM8403 + głośnik
+
+
+
+
+
+
+

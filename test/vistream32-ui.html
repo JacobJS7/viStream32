@@ -1,0 +1,279 @@
+<!doctype html>
+<html>
+<head>
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>vistream32</title>
+<style>
+  :root{
+    --bg:#17140f;
+    --panel:#1d1911;
+    --line:#3a3327;
+    --text:#efe7d8;
+    --text-dim:#9c927e;
+    --accent:#e2a33b;
+    --accent-dim:#4a3d21;
+    --danger:#b85c4b;
+    --mono:ui-monospace,SFMono-Regular,Consolas,"Liberation Mono",Menlo,monospace;
+    --sans:system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;
+  }
+  *{box-sizing:border-box}
+  body{
+    margin:0;
+    background:var(--bg);
+    color:var(--text);
+    font-family:var(--sans);
+    -webkit-tap-highlight-color:transparent;
+  }
+  .frame{max-width:480px;margin:0 auto;padding:0 0 40px}
+
+  header{
+    padding:20px 20px 16px;
+    display:flex;
+    align-items:baseline;
+    justify-content:space-between;
+    border-bottom:1px solid var(--line);
+  }
+  header h1{
+    font-size:16px;
+    font-weight:600;
+    letter-spacing:.02em;
+    margin:0;
+    color:var(--text);
+  }
+  header span{
+    font-family:var(--mono);
+    font-size:11px;
+    color:var(--accent);
+  }
+
+  section{padding:18px 20px;border-bottom:1px solid var(--line)}
+  section h2{
+    font-size:12px;
+    font-weight:600;
+    color:var(--text-dim);
+    margin:0 0 14px;
+  }
+
+  /* now playing display */
+  .display{
+    background:var(--panel);
+    border:1px solid var(--line);
+    border-radius:2px;
+    padding:14px 16px;
+    margin-bottom:16px;
+  }
+  #title{
+    font-family:var(--mono);
+    font-size:15px;
+    color:var(--accent);
+    white-space:nowrap;
+    overflow:hidden;
+    text-overflow:ellipsis;
+    margin-bottom:10px;
+  }
+  .seekrow{display:flex;align-items:center;gap:10px}
+  #time{font-family:var(--mono);font-size:11px;color:var(--text-dim);white-space:nowrap}
+
+  input[type=range]{
+    -webkit-appearance:none;
+    appearance:none;
+    width:100%;
+    height:3px;
+    background:var(--line);
+    border-radius:2px;
+    outline:none;
+  }
+  input[type=range]::-webkit-slider-thumb{
+    -webkit-appearance:none;
+    width:14px;height:14px;
+    border-radius:50%;
+    background:var(--accent);
+    cursor:pointer;
+    border:2px solid var(--bg);
+  }
+  input[type=range]::-moz-range-thumb{
+    width:14px;height:14px;border-radius:50%;
+    background:var(--accent);border:2px solid var(--bg);cursor:pointer;
+  }
+  input[type=range]::-webkit-slider-runnable-track{
+    height:3px;border-radius:2px;background:var(--line);
+  }
+
+  /* transport */
+  .transport{display:flex;gap:10px;margin-bottom:18px}
+  .transport button{flex:1}
+  button{
+    font-family:var(--sans);
+    font-size:14px;
+    font-weight:600;
+    color:var(--text);
+    background:var(--panel);
+    border:1px solid var(--line);
+    border-radius:3px;
+    padding:12px 10px;
+    cursor:pointer;
+  }
+  button:active{background:var(--accent-dim);border-color:var(--accent)}
+  #playPauseButton{
+    background:var(--accent-dim);
+    border-color:var(--accent);
+    color:var(--accent);
+  }
+
+  .volrow{display:flex;align-items:center;gap:12px}
+  .volrow label{font-size:11px;color:var(--text-dim);width:44px;flex-shrink:0}
+  .volrow span{font-family:var(--mono);font-size:12px;color:var(--text-dim);width:32px;text-align:right;flex-shrink:0}
+
+  /* files */
+  .pathbar{
+    font-family:var(--mono);
+    font-size:12px;
+    color:var(--text-dim);
+    margin-bottom:10px;
+  }
+  #filesPath{color:var(--accent)}
+
+  #files{border-top:1px solid var(--line)}
+  .file{
+    padding:10px 0;
+    border-bottom:1px solid var(--line);
+    display:flex;
+    align-items:center;
+    justify-content:space-between;
+    gap:10px;
+  }
+  .file-name{
+    font-size:13px;
+    overflow:hidden;
+    text-overflow:ellipsis;
+    white-space:nowrap;
+    cursor:pointer;
+  }
+  .file[data-is-dir="1"] .file-name{color:var(--text)}
+  .file[data-is-dir="1"]{cursor:pointer}
+
+  .file-actions{display:flex;gap:6px;flex-shrink:0}
+  .file-actions button{
+    padding:6px 9px;
+    font-size:12px;
+    font-family:var(--mono);
+    min-width:0;
+  }
+  button[data-action="play"]{color:var(--accent);border-color:var(--accent-dim)}
+  button[data-action="delete"]{color:var(--danger);border-color:var(--danger)}
+
+  .uploadrow{display:flex;gap:8px;margin-top:14px}
+  .uploadrow input[type=file]{
+    flex:1;
+    font-size:12px;
+    color:var(--text-dim);
+    background:var(--panel);
+    border:1px solid var(--line);
+    border-radius:3px;
+    padding:8px;
+  }
+  .uploadrow button{flex-shrink:0}
+
+  .folderrow{display:flex;gap:8px;margin-top:10px}
+  .folderrow input{
+    flex:1;
+    background:var(--panel);
+    border:1px solid var(--line);
+    border-radius:3px;
+    color:var(--text);
+    font-size:13px;
+    padding:10px;
+  }
+
+  form.config{display:flex;flex-direction:column;gap:8px}
+  form.config input{
+    background:var(--panel);
+    border:1px solid var(--line);
+    border-radius:3px;
+    color:var(--text);
+    font-size:13px;
+    padding:10px;
+  }
+  form.config button{margin-top:2px}
+
+  ::placeholder{color:var(--text-dim);opacity:.7}
+</style>
+</head>
+<body>
+<div class="frame">
+
+  <header>
+    <h1>vistream32</h1>
+    <span>local player</span>
+  </header>
+
+  <section>
+    <div class="display">
+      <div id="title">Loading&hellip;</div>
+      <div class="seekrow">
+        <input id="seek" type="range" min="0" max="1" value="0" oninput="setSeek(this.value)">
+      </div>
+      <div id="time" style="margin-top:8px">00:00 / 00:00</div>
+    </div>
+
+    <div class="transport">
+      <button onclick="post('/prev')">Prev</button>
+      <button id="playPauseButton" onclick="togglePlayPause()">Play</button>
+      <button onclick="post('/next')">Next</button>
+    </div>
+
+    <div class="volrow">
+      <label for="volume">Volume</label>
+      <input id="volume" type="range" min="0" max="100" value="0" oninput="setVolume(this.value)">
+      <span id="vol">0</span>
+    </div>
+  </section>
+
+  <section>
+    <h2>Files</h2>
+    <div class="pathbar">path: <span id="filesPath">/</span></div>
+    <div id="files">Loading&hellip;</div>
+
+    <div class="uploadrow">
+      <form id="uploadForm" style="display:flex;flex:1;gap:8px">
+        <input id="uploadFile" type="file" accept=".mp3,audio/mpeg">
+        <button type="submit">Upload</button>
+      </form>
+    </div>
+
+    <div class="folderrow">
+      <input id="newFolder" placeholder="New folder name">
+      <button onclick="makeFolder()">Create</button>
+    </div>
+  </section>
+
+  <section style="border-bottom:none">
+    <h2>Network</h2>
+    <form id="configForm" class="config">
+      <input id="ssid" placeholder="SSID">
+      <input id="password" type="password" placeholder="Password">
+      <button type="submit">Save &amp; restart</button>
+    </form>
+  </section>
+
+</div>
+
+<script>
+let seekTimer;let isPaused=true;let filesPath='/';async function post(path){await fetch(path,{method:'POST'});refresh()}
+function togglePlayPause(){post(isPaused?'/play':'/pause')}
+function setVolume(value){document.querySelector('#vol').textContent=value;clearTimeout(window.volumeTimer);window.volumeTimer=setTimeout(()=>fetch('/volume?value='+value,{method:'POST'}),120)}
+function setSeek(value){clearTimeout(seekTimer);seekTimer=setTimeout(()=>fetch('/seek?position='+value,{method:'POST'}),200)}
+async function refresh(){let s=await (await fetch('/status')).json();isPaused=s.paused;document.querySelector('#playPauseButton').textContent=isPaused?'Play':'Pause';document.querySelector('#title').textContent=s.track;document.querySelector('#vol').textContent=s.volume;document.querySelector('#volume').value=s.volume;document.querySelector('#seek').max=s.duration;document.querySelector('#seek').value=s.position;document.querySelector('#time').textContent=s.positionText+' / '+s.durationText}
+function parentPath(path){if(path==='/')return '/';let i=path.lastIndexOf('/');return i<=0?'/':path.slice(0,i)}
+const listContainer=document.querySelector('#files');
+async function loadFiles(path){filesPath=path||'/';let entries=await (await fetch('/files?path='+encodeURIComponent(filesPath))).json();document.querySelector('#filesPath').textContent=filesPath;listContainer.replaceChildren();entries.forEach(e=>{const full=e.name==='..'?parentPath(filesPath):(filesPath==='/'?'/'+e.name:filesPath+'/'+e.name);const el=document.createElement('div');el.className='file';el.dataset.path=full;el.dataset.isDir=e.isDirectory?'1':'0';const name=document.createElement('span');name.className='file-name';name.textContent=(e.isDirectory?'[D] ':'')+e.name;el.appendChild(name);if(!e.isDirectory){const actions=document.createElement('div');actions.className='file-actions';for(const action of ['play','download','delete']){const button=document.createElement('button');button.dataset.action=action;button.dataset.path=full;button.dataset.name=e.name;button.textContent=action[0].toUpperCase()+action.slice(1);actions.appendChild(button)}el.appendChild(actions)}listContainer.appendChild(el)});if(!entries.length)listContainer.textContent='Empty'}
+listContainer.addEventListener('click',async(event)=>{const action=event.target.dataset.action;const path=event.target.dataset.path;if(action){if(action==='play')await post('/playFile?path='+encodeURIComponent(path));if(action==='download')window.location.href='/download?path='+encodeURIComponent(path);if(action==='delete'&&confirm('Na pewno usunąć '+event.target.dataset.name+'?')){await post('/delete?path='+encodeURIComponent(path));loadFiles(filesPath)}return}const el=event.target.closest('[data-path]');if(el&&el.dataset.isDir==='1'){loadFiles(el.dataset.path)}});
+document.querySelector('#uploadForm').addEventListener('submit',async(event)=>{event.preventDefault();const file=document.querySelector('#uploadFile').files[0];if(!file)return;const form=new FormData();form.append('path',filesPath);form.append('file',file);await fetch('/upload?path='+encodeURIComponent(filesPath),{method:'POST',body:form});loadFiles(filesPath)});
+async function makeFolder(){const name=document.querySelector('#newFolder').value.trim();if(name)await post('/mkdir?path='+encodeURIComponent((filesPath==='/'?'':filesPath)+'/'+name));loadFiles(filesPath)}
+async function loadConfig(){const c=await (await fetch('/config')).json();document.querySelector('#ssid').value=c.ssid;}
+document.querySelector('#configForm').addEventListener('submit',async(event)=>{event.preventDefault();await fetch('/config',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:'ssid='+encodeURIComponent(document.querySelector('#ssid').value)+'&password='+encodeURIComponent(document.querySelector('#password').value)});alert('Restarting AP');});
+refresh();loadFiles('/');setInterval(refresh,1500);
+loadConfig();
+</script>
+</body>
+</html>
