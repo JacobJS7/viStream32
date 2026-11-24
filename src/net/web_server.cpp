@@ -210,6 +210,58 @@ void webMkdir() {
 	webServer.send(503, "text/plain", "Busy");
 }
 
+#define UPLOAD_WRITE_RETRIES 3
+
+// Zamyka i usuwa niedokończony plik uploadu. Bezpieczne przy wielokrotnym wywołaniu.
+static void discardUploadFile() {
+	xSemaphoreTake(sdMutex, portMAX_DELAY);
+	if (uploadFile) uploadFile.close();
+	if (!uploadTargetPath.isEmpty()) SD.remove(uploadTargetPath.c_str());
+	xSemaphoreGive(sdMutex);
+	uploadFile = File();
+	uploadTargetPath = "";
+}
+
+// Przerywa upload: usuwa plik i zamyka połączenie. Bez zamknięcia WebServer
+// czytałby resztę body (MB danych) bajt po bajcie bez oddawania CPU, co
+// głodzi IDLE0 i kończy się resetem przez task watchdog.
+static void abortUpload() {
+	uploadFailed = true;
+	discardUploadFile();
+	webServer.client().stop();
+	Serial.println("[upload] przerwano upload, plik usunięty, połączenie zamknięte");
+}
+
+// Zapisuje kawałek; przy częściowym zapisie (błąd karty) zamyka plik, otwiera
+// go w trybie dopisywania i dopisuje brakującą część na podstawie rozmiaru na karcie.
+// Wymaga sdMutex. `fileOffset` = bajty pliku zapisane poprawnie przed tym kawałkiem.
+static bool writeUploadChunk(uint32_t fileOffset, const uint8_t *data, size_t length) {
+	size_t written = uploadFile.write(data, length);
+	if (written == length) return true;
+
+	for (uint8_t attempt = 1; attempt <= UPLOAD_WRITE_RETRIES; ++attempt) {
+		Serial.printf("[upload] BŁĄD ZAPISU: żądano=%u zapisano=%u, próba %u/%u\n",
+				static_cast<unsigned>(length), static_cast<unsigned>(written), attempt, UPLOAD_WRITE_RETRIES);
+		uploadFile.close();
+		vTaskDelay(pdMS_TO_TICKS(20 * attempt));
+		uploadFile = SD.open(uploadTargetPath.c_str(), FILE_APPEND);
+		if (!uploadFile) continue;
+		uint32_t sizeOnCard = static_cast<uint32_t>(uploadFile.size());
+		if (sizeOnCard < fileOffset || sizeOnCard > fileOffset + length) {
+			Serial.printf("[upload] nieoczekiwany rozmiar pliku %u (oczekiwano %u..%u)\n",
+					sizeOnCard, fileOffset, static_cast<unsigned>(fileOffset + length));
+			return false;
+		}
+		size_t alreadyStored = sizeOnCard - fileOffset;
+		written = alreadyStored + uploadFile.write(data + alreadyStored, length - alreadyStored);
+		if (written == length) {
+			Serial.println("[upload] zapis ponowiony poprawnie");
+			return true;
+		}
+	}
+	return false;
+}
+
 void handleUpload(HTTPUpload &upload) {
 	static uint32_t uploadBytesTotal = 0;
 	static uint32_t lastHeapLogMillis = 0;
@@ -254,31 +306,19 @@ void handleUpload(HTTPUpload &upload) {
 		if (upload.currentSize > 0) {
 			if (xSemaphoreTake(sdMutex, pdMS_TO_TICKS(200)) != pdTRUE) {
 				Serial.println("[upload] ERROR: could not acquire sdMutex in 200ms during write - aborting");
-				uploadFailed = true;
-				if (uploadFile) {
-					uploadFile.close();
-				}
-				if (!uploadTargetPath.isEmpty()) {
-					SD.remove(uploadTargetPath.c_str());
-				}
+				abortUpload();
 				return;
 			}
-			size_t written = uploadFile.write(upload.buf, upload.currentSize);
+			bool chunkOk = writeUploadChunk(uploadBytesTotal, upload.buf, upload.currentSize);
 			xSemaphoreGive(sdMutex);
-			if (written != upload.currentSize) {
-				Serial.printf("[upload] BŁĄD ZAPISU: żądano=%u zapisano=%u — przerywam upload\n", upload.currentSize, written);
-				uploadFailed = true;
-				if (uploadFile) {
-					uploadFile.close();
-				}
-				if (!uploadTargetPath.isEmpty()) {
-					SD.remove(uploadTargetPath.c_str());
-				}
+			if (!chunkOk) {
+				Serial.printf("[upload] zapis nieudany po %u bajtach — przerywam upload\n", uploadBytesTotal);
+				abortUpload();
 				return;
 			}
-			uploadBytesTotal += written;
+			uploadBytesTotal += upload.currentSize;
 			chunkCounter++;
-			lastChunkLogBytes += written;
+			lastChunkLogBytes += upload.currentSize;
 			if (millis() - lastHeapLogMillis >= 2000) {
 				lastHeapLogMillis = millis();
 				Serial.printf("[upload] heap total=%u freeHeap=%u\n", uploadBytesTotal, ESP.getFreeHeap());
@@ -291,25 +331,26 @@ void handleUpload(HTTPUpload &upload) {
 	} else if (upload.status == UPLOAD_FILE_END) {
 		Serial.printf("[upload] end total=%u expected=%u freeHeap=%u failed=%d\n", uploadBytesTotal, upload.totalSize, ESP.getFreeHeap(), uploadFailed ? 1 : 0);
 		if (uploadFile) {
-			if (xSemaphoreTake(sdMutex, pdMS_TO_TICKS(200)) == pdTRUE) {
-				uploadFile.close();
-				xSemaphoreGive(sdMutex);
-			}
+			xSemaphoreTake(sdMutex, portMAX_DELAY);
+			uploadFile.close();
+			xSemaphoreGive(sdMutex);
 		}
 		if (uploadFailed || uploadBytesTotal != upload.totalSize || uploadBytesTotal == 0) {
 			uploadFailed = true;
-			if (!uploadTargetPath.isEmpty()) {
-				if (xSemaphoreTake(sdMutex, pdMS_TO_TICKS(200)) == pdTRUE) {
-					SD.remove(uploadTargetPath.c_str());
-					xSemaphoreGive(sdMutex);
-				}
-			}
+			discardUploadFile();
 			Serial.println("[upload] upload failed and temporary file was removed");
 		}
 		uploadFile = File();
 		uploadTargetPath = "";
+	} else if (upload.status == UPLOAD_FILE_ABORTED) {
+		// Zerwane połączenie (albo nasze abortUpload()) — nie zostawiamy ani
+		// otwartego pliku, ani niedokończonego pliku na karcie.
+		Serial.printf("[upload] aborted po %u bajtach\n", uploadBytesTotal);
+		uploadFailed = true;
+		discardUploadFile();
 	}
-	yield();
+	// Oddaj CPU na 1 tick (yield() nie wpuszcza IDLE0 i watchdog resetuje ESP).
+	vTaskDelay(1);
 }
 
 void handleUploadRequest() {
