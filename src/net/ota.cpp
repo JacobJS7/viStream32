@@ -26,6 +26,8 @@ void handleOtaUpload(HTTPUpload &upload) {
 		otaError = "";
 		otaWrittenBytes = 0;
 		otaProgress = 0;
+		otaWrittenKb = 0;
+		otaTotalKb = 0;
 		String name = upload.filename;
 		name.toLowerCase();
 		if (!name.endsWith(".bin")) {
@@ -34,6 +36,7 @@ void handleOtaUpload(HTTPUpload &upload) {
 		}
 		// Content-Length obejmuje też nagłówki multipart — do paska postępu wystarczy.
 		otaExpectedBytes = static_cast<uint32_t>(max(1, webServerInstance().clientContentLength()));
+		otaTotalKb = otaExpectedBytes / 1024;
 		Serial.printf("[ota] start %s, ok. %u B\n", upload.filename.c_str(), otaExpectedBytes);
 		stopPlayback();
 		otaInProgress = true;
@@ -49,6 +52,7 @@ void handleOtaUpload(HTTPUpload &upload) {
 			return;
 		}
 		otaWrittenBytes += upload.currentSize;
+		otaWrittenKb = otaWrittenBytes / 1024;
 		otaProgress = static_cast<uint8_t>(min(99UL, static_cast<unsigned long>(otaWrittenBytes) * 100UL / otaExpectedBytes));
 	} else if (upload.status == UPLOAD_FILE_END) {
 		if (otaFailed) return;

@@ -29,6 +29,7 @@ void setup() {
 	persistenceBegin();
 
 	displayBegin();
+	setSplashStep("SD card...");
 	splashProgress = 10;
 	xTaskCreatePinnedToCore(
 			uiTask,
@@ -50,12 +51,14 @@ void setup() {
 	Serial.println("Karta SD OK");
 	batteryBegin();
 	updateBatteryVoltage();
+	setSplashStep("Audio...");
 	splashProgress = 40;
 
 	if (!playerBegin()) {
 		Serial.println("Nie udało się uruchomić MP3 playera");
 		fail();
 	}
+	setSplashStep("Playlist...");
 	splashProgress = 70;
 
 	audioMutex = xSemaphoreCreateMutex();
@@ -82,6 +85,7 @@ void setup() {
 		refreshBrowser();
 		setScreen(SCREEN_BROWSER);
 	}
+	setSplashStep("Ready");
 	splashProgress = 100;
 	uiReady = true;
 

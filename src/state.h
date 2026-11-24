@@ -43,6 +43,8 @@ extern volatile bool sdMissing;
 extern volatile uint8_t splashProgress;
 extern volatile bool otaInProgress;
 extern volatile uint8_t otaProgress;          // 0..100
+extern volatile uint32_t otaWrittenKb;        // do ekranu OTA
+extern volatile uint32_t otaTotalKb;          // 0 = nieznany
 extern float batteryVoltage;
 
 // --- Wi-Fi ---

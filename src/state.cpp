@@ -27,6 +27,8 @@ volatile bool sdMissing = false;
 volatile uint8_t splashProgress = 0;
 volatile bool otaInProgress = false;
 volatile uint8_t otaProgress = 0;
+volatile uint32_t otaWrittenKb = 0;
+volatile uint32_t otaTotalKb = 0;
 float batteryVoltage = 4.2f;
 
 bool wifiApEnabled = false;

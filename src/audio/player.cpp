@@ -69,16 +69,20 @@ void cyclePlaybackMode() {
 		repeatMode = REPEAT_OFF;
 		rebuildShuffleOrder(currentTrack);
 		Serial.println("Tryb: SHUFFLE");
+		showToast("SHUFFLE", TOAST_ICON_SHUFFLE);
 	} else if (shuffleEnabled) {
 		shuffleEnabled = false;
 		repeatMode = REPEAT_ONE;
 		Serial.println("Tryb: REPEAT ONE");
+		showToast("REPEAT ONE", TOAST_ICON_REPEAT);
 	} else if (repeatMode == REPEAT_ONE) {
 		repeatMode = REPEAT_ALL;
 		Serial.println("Tryb: REPEAT ALL");
+		showToast("REPEAT ALL", TOAST_ICON_REPEAT);
 	} else {
 		repeatMode = REPEAT_OFF;
 		Serial.println("Tryb: NORMAL");
+		showToast("NORMAL", TOAST_ICON_PLAY);
 	}
 	xSemaphoreGive(stateMutex);
 	requestStateSave();

@@ -48,7 +48,7 @@ Key pieces:
 
 **Tasks / cores**
 - `audioFeedTask` (Core 1): reads 512-byte chunks from the open SD `File f` and feeds `mp3.write()` while `mp3.availableForWrite() > 512`. On EOF it calls `handleTrackEnd()` (applies repeat/shuffle/auto-next). This loop must never be blocked for long — audio glitches otherwise.
-- `uiTask` (Core 0): redraws the OLED every `UI_FRAME_INTERVAL_MS` (40 ms) using full-buffer U8g2. Screens are a state machine (`Screen` enum: `SCREEN_BROWSER`, `SCREEN_NOWPLAYING`; splash shown until `uiReady`). Change screens only via `setScreen()` so transitions animate. Animations are time-based (`millis()`), not frame-count based.
+- `uiTask` (Core 0): redraws the OLED every `UI_FRAME_INTERVAL_MS` (40 ms) using full-buffer U8g2. Screens are a state machine (`Screen` enum: `SCREEN_BROWSER`, `SCREEN_NOWPLAYING`; splash shown until `uiReady`). Change screens only via `setScreen()` so transitions animate. Animations are time-based (`millis()`), not frame-count based. A centered overlay (volume bar or a short toast) is drawn on top of either screen via `showVolumeOverlay()` / `showToast(literal, icon)`. Icons are drawn with U8g2 primitives (`icon*` helpers in `display.cpp`), no bitmaps; each `draw*` function documents its Y zones. UI text is English; fonts are Latin-1 only.
 - `wifiTask` (Core 0): AP (`configuredSsid`/`configuredPassword` from NVS) and `WebServer` on port 80; the only place that reacts to the Wi-Fi switch pin. The web server is started/stopped together with the AP — calling `WebServer::begin()` while Wi-Fi is off asserts in lwIP.
 - Arduino `loop()`: button handling (ISR-set flags → debounced press/long-press/double-click logic), battery ADC sampling, periodic NVS state save.
 
