@@ -32,6 +32,7 @@ Firmware is split into modules under `src/` (includes are relative to `src/`, e.
 | `types.h` | `RepeatMode`, `Screen`, `DirectoryEntry` |
 | `state.h/.cpp` | state shared by several modules (`extern`) + the three mutexes; module-private state is `static` in that module's `.cpp` |
 | `audio/player` | decoder objects, playlist, transport, volume, `audioFeedTask` |
+| `audio/mp3_info` | MP3 metadata without decoding: ID3v2/ID3v1 title/artist, first frame (bitrate/sample rate), Xing/Info/VBRI (frame count, TOC) |
 | `storage/sd_fs` | path helpers, `scanDirectory`, `removePathRecursive` |
 | `storage/persistence` | NVS (`Preferences`): settings, resume state, `requestStateSave` / `persistencePoll` |
 | `input/buttons` | ISRs and button logic (`buttonsPoll`) |
@@ -39,6 +40,7 @@ Firmware is split into modules under `src/` (includes are relative to `src/`, e.
 | `ui/browser` | OLED file-browser navigation |
 | `net/wifi_ap` | AP on/off from the switch, `wifiTask` |
 | `net/web_server` | HTTP routes and handlers |
+| `net/ota` | firmware update over HTTP (`POST /update`, `Update` library) |
 | `power/battery` | ADC battery measurement |
 | `web/index.html` | the web page, embedded via `board_build.embed_txtfiles` |
 
@@ -59,7 +61,8 @@ Key pieces:
 
 **Playback model**
 - Playlist = the `.mp3` files of one directory (`loadPlaylistFromDirectory`); `tracks` holds full paths. Shuffle uses a precomputed `shuffleOrder` permutation.
-- `BackgroundAudioMP3` exposes no duration/time index, so duration, position, seek, and resume are all estimates based on `APPROXIMATE_MP3_BYTES_PER_SECOND` (16000 ≈ 128 kbps). Seeking = `f.seek()` + `mp3.flush()`. Position is tracked via `millis()` (`updatePlaybackPosition`).
+- `BackgroundAudioMP3` exposes no duration/time index, so `openTrack()` calls `readMp3Info()` (`audio/mp3_info`): duration comes from the Xing/VBRI frame count or, for CBR, from size and bitrate. The file is left positioned at the first audio frame, so ID3 tags and cover art never reach the decoder. Seeking is in seconds (`seekToSecond` / `seekBySeconds`) via `mp3ByteOffsetForSecond()`, which uses the Xing TOC for VBR and is linear otherwise, followed by `mp3.flush()`. `APPROXIMATE_MP3_BYTES_PER_SECOND` (128 kbps) is only the fallback when no frame header is found. Position is tracked via `millis()` (`updatePlaybackPosition`). Each track logs a `MP3: ...` line with what was parsed.
+- ID3 title/artist live in `currentTrackTitle` / `currentTrackArtist`, guarded by `audioMutex` rather than `stateMutex`, because `openTrack()` is called both with and without `stateMutex` held. The OLED font is Latin-1 only, so Polish diacritics don't render there; the web page shows them fine.
 - Volume is software gain via `mp3.setGain()` (0 … `MAX_GAIN`, step `GAIN_STEP`).
 - State is persisted with `Preferences` (namespace `vistream`): `lastFolder`, `lastTrackIndex`, `lastPositionSec`, `lastVolume`, `shuffle`, `repeatMode`, `wifiSsid`, `wifiPassword`. Call `requestStateSave()` rather than writing NVS directly; `persistencePoll()` in `loop()` flushes it. On boot it restores the last folder/position, else falls back to `/muzyka`, else the browser at `/`.
 
@@ -78,4 +81,6 @@ I2S: BCLK 26, LRC 25, DOUT 27 · I2C (OLED): SDA 21, SCL 22 · SD CS 5 (VSPI def
 
 I2S DOUT was moved from 22 to 27 to avoid the I2C SCL conflict — older sketches in `test/` still use 22. When adding pins, avoid GPIO 6–11 (flash), and remember GPIO 34–39 are input-only with no internal pull-ups.
 
-`platformio.ini` sets `CONFIG_ESP_TASK_WDT_TIMEOUT_S=15`; long blocking operations in any task can still trip the watchdog. Flash usage is ~94% of the default app partition — larger features will need a bigger partition scheme (e.g. `board_build.partitions = huge_app.csv`).
+`platformio.ini` sets `CONFIG_ESP_TASK_WDT_TIMEOUT_S=15`, but the precompiled Arduino core uses its own task watchdog (5 s on IDLE0). Upload handlers that loop over HTTP body chunks on Core 0 must call `vTaskDelay(1)`; `yield()` does not let IDLE0 run. On error they must close the client connection, otherwise WebServer drains the rest of the body in a tight loop and the watchdog resets the chip.
+
+Partition table is `min_spiffs.csv`: two 1.9 MB OTA app slots, NVS at 0x9000 as before. After building, the firmware can be uploaded from the web page ("Firmware" section) using `.pio/build/esp32doit-devkit-v1/firmware.bin`. Changing the partition table again requires a USB flash.

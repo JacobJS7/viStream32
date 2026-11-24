@@ -6,7 +6,7 @@
 //   stateMutex: playlista i pozycja (tracks, currentTrack, shuffleOrder, repeatMode,
 //               shuffleEnabled, playlistDirectory, currentDirectory, directoryEntries,
 //               browserSelection/Offset, currentPositionSec)
-//   audioMutex: dekoder mp3 i currentGain
+//   audioMutex: dekoder mp3, currentGain, currentTrackTitle/Artist/Bitrate
 //   sdMutex:    każdy dostęp do karty SD (pliki, katalogi, upload/download)
 
 #include <Arduino.h>
@@ -25,6 +25,10 @@ extern volatile bool playbackStopped;
 extern float currentGain;
 extern volatile uint32_t currentPositionSec;
 extern volatile uint32_t currentTrackDurationSec;
+// Z tagów ID3 bieżącego utworu (puste gdy brak). Chronione przez audioMutex.
+extern String currentTrackTitle;
+extern String currentTrackArtist;
+extern uint16_t currentTrackBitrate;          // kbps pierwszej ramki, 0 = nieznany
 
 // --- Przeglądarka OLED ---
 extern String currentDirectory;               // folder pokazywany w przeglądarce
@@ -37,6 +41,8 @@ extern Screen currentScreen;
 extern volatile bool uiReady;
 extern volatile bool sdMissing;
 extern volatile uint8_t splashProgress;
+extern volatile bool otaInProgress;
+extern volatile uint8_t otaProgress;          // 0..100
 extern float batteryVoltage;
 
 // --- Wi-Fi ---

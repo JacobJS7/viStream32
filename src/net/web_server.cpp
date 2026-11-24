@@ -9,6 +9,7 @@
 #include "storage/sd_fs.h"
 #include "storage/persistence.h"
 #include "ui/display.h"
+#include "net/ota.h"
 
 // src/web/index.html wbudowany w firmware (platformio.ini: board_build.embed_txtfiles).
 extern const char index_html[] asm("_binary_src_web_index_html_start");
@@ -21,6 +22,7 @@ static bool uploadFailed = false;
 void webServerStart() { webServer.begin(); }
 void webServerStop() { webServer.stop(); }
 void webServerHandle() { webServer.handleClient(); }
+WebServer &webServerInstance() { return webServer; }
 
 String decodeUrlComponent(const String &value) {
 	String decoded;
@@ -59,7 +61,7 @@ String jsonEscape(const String &value) {
 		char character = value[index];
 		if (character == '"' || character == '\\') escaped += '\\';
 		if (character == '\n') escaped += "\\n";
-		else if (character != '\r') escaped += character;
+		else if (static_cast<uint8_t>(character) >= 0x20) escaped += character;  // pomija \r, \t i inne sterujące (np. z tagów ID3)
 	}
 	return escaped;
 }
@@ -79,7 +81,7 @@ void sendPlayerStatus() {
 	bool shuffle;
 	RepeatMode repeat;
 	xSemaphoreTake(stateMutex, portMAX_DELAY);
-	track = tracks.empty() ? String("") : tracks[currentTrack];
+	track = (tracks.empty() || currentTrack >= tracks.size()) ? String("") : tracks[currentTrack];
 	position = currentPositionSec;
 	shuffle = shuffleEnabled;
 	repeat = repeatMode;
@@ -87,6 +89,9 @@ void sendPlayerStatus() {
 	xSemaphoreTake(audioMutex, portMAX_DELAY);
 	paused = playbackPaused || playbackStopped;
 	float gain = currentGain;
+	String title = currentTrackTitle;
+	String artist = currentTrackArtist;
+	uint16_t bitrate = currentTrackBitrate;
 	xSemaphoreGive(audioMutex);
 	duration = currentTrackDurationSec;
 	int separator = track.lastIndexOf('/');
@@ -94,7 +99,9 @@ void sendPlayerStatus() {
 	uint32_t displayPosition = min(position, duration);
 	int volume = static_cast<int>(gain * 100.0f / MAX_GAIN);
 	String mode = shuffle ? "shuffle" : (repeat == REPEAT_ONE ? "repeat-one" : (repeat == REPEAT_ALL ? "repeat-all" : "normal"));
-	String json = "{\"track\":\"" + jsonEscape(track) + "\",\"position\":" + String(displayPosition) +
+	String json = "{\"track\":\"" + jsonEscape(track) + "\",\"title\":\"" + jsonEscape(title) +
+		"\",\"artist\":\"" + jsonEscape(artist) + "\",\"bitrate\":" + String(bitrate) +
+		",\"position\":" + String(displayPosition) +
 		",\"duration\":" + String(duration) + ",\"volume\":" + String(volume) +
 		",\"paused\":" + String(paused ? "true" : "false") + ",\"mode\":\"" + mode +
 		"\",\"wifiEnabled\":" + String(wifiApEnabled ? "true" : "false") +
@@ -391,10 +398,7 @@ void webVolume() {
 
 void webSeek() {
 	int32_t requestedPosition = static_cast<int32_t>(webServer.arg("position").toInt());
-	uint32_t target = requestedPosition < 0 ? 0 : static_cast<uint32_t>(requestedPosition);
-	updatePlaybackPosition();
-	int32_t delta = static_cast<int32_t>(target) - static_cast<int32_t>(currentPositionSec);
-	seekByBytes(delta * static_cast<int32_t>(APPROXIMATE_MP3_BYTES_PER_SECOND));
+	seekToSecond(requestedPosition < 0 ? 0 : static_cast<uint32_t>(requestedPosition));
 	webServer.send(200, "text/plain", "OK");
 }
 
@@ -481,4 +485,5 @@ void registerWebRoutes() {
 	webServer.on("/upload", HTTP_POST, uploadComplete, handleUploadRequest);
 	webServer.on("/config", HTTP_GET, webConfigGet);
 	webServer.on("/config", HTTP_POST, webConfigPost);
+	webServer.on("/update", HTTP_POST, otaComplete, []() { handleOtaUpload(webServer.upload()); });
 }

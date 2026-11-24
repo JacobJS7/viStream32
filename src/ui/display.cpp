@@ -41,15 +41,24 @@ bool drawNowPlaying() {
 	} else {
 		return false;
 	}
+	String tagTitle;
+	String tagArtist;
 	if (xSemaphoreTake(audioMutex, pdMS_TO_TICKS(20)) == pdTRUE) {
 		paused = playbackPaused || playbackStopped;
 		displayGain = currentGain;
+		tagTitle = currentTrackTitle;
+		tagArtist = currentTrackArtist;
 		xSemaphoreGive(audioMutex);
 	} else {
 		paused = false;
 	}
-	int separator = title.lastIndexOf('/');
-	if (separator >= 0) title = title.substring(separator + 1);
+	if (tagTitle.length() > 0) {
+		// Z tagów ID3. Czcionka OLED ma tylko Latin-1 — polskie znaki się nie wyświetlą.
+		title = tagArtist.length() > 0 ? tagArtist + " - " + tagTitle : tagTitle;
+	} else {
+		int separator = title.lastIndexOf('/');
+		if (separator >= 0) title = title.substring(separator + 1);
+	}
 
 	static size_t marqueeTrack = static_cast<size_t>(-1);
 	static int marqueeOffset = 0;
@@ -239,6 +248,21 @@ bool drawBrowser() {
 	return true;
 }
 
+void drawOta() {
+	u8g2.clearBuffer();
+	u8g2.setFont(u8g2_font_7x13B_tf);
+	const char *title = "Aktualizacja";
+	u8g2.drawStr((128 - u8g2.getStrWidth(title)) / 2, 22, title);
+	uint8_t progress = min(static_cast<uint8_t>(100), static_cast<uint8_t>(otaProgress));
+	u8g2.drawRFrame(14, 32, 100, 8, 2);
+	if (progress > 2) u8g2.drawRBox(16, 34, progress * 96 / 100, 4, 1);
+	u8g2.setFont(u8g2_font_5x7_tf);
+	char text[24];
+	snprintf(text, sizeof(text), "%u%%  nie wylaczaj", progress);
+	u8g2.drawStr((128 - u8g2.getStrWidth(text)) / 2, 54, text);
+	u8g2.sendBuffer();
+}
+
 void drawNoSd(uint32_t now) {
 	u8g2.clearBuffer();
 	u8g2.setFont(u8g2_font_9x15B_tr);
@@ -282,7 +306,9 @@ void uiTask(void *parameter) {
 	(void)parameter;
 	for (;;) {
 		uint32_t now = millis();
-		if (sdMissing) {
+		if (otaInProgress) {
+			drawOta();
+		} else if (sdMissing) {
 			drawNoSd(now);
 		} else if (!uiReady) {
 			drawSplash(now);

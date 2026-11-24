@@ -1,7 +1,7 @@
 #pragma once
 // Odtwarzacz: playlista, sterowanie, głośność i task karmiący dekoder (Core 1).
-// Czas/pozycja/seek to estymaty z APPROXIMATE_MP3_BYTES_PER_SECOND
-// (BackgroundAudioMP3 nie udostępnia indeksu czasu).
+// Czas, pozycja i seek z metadanych MP3 (audio/mp3_info: bitrate, Xing/VBRI, TOC);
+// APPROXIMATE_MP3_BYTES_PER_SECOND tylko gdy nie da się odczytać nagłówka ramki.
 #include <Arduino.h>
 
 // Inicjalizacja I2S i dekodera MP3. false = błąd.
@@ -20,7 +20,8 @@ void togglePlayPause();
 void stopPlayback();
 bool playlistEmpty();
 
-void seekByBytes(int32_t delta);
+void seekBySeconds(int32_t deltaSec);
+void seekToSecond(uint32_t sec);
 void restorePosition(uint32_t positionSec);
 void updatePlaybackPosition();
 void resetPlaybackPosition(uint32_t positionSec = 0);

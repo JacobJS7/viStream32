@@ -264,6 +264,15 @@
       <input id="password" type="password" placeholder="Password">
       <button type="submit">Save &amp; restart</button>
     </form>
+
+    <h2 style="margin-top:22px">Firmware</h2>
+    <div class="uploadrow">
+      <form id="otaForm" style="display:flex;flex:1;gap:8px;align-items:center;flex-wrap:wrap">
+        <input id="otaFile" type="file" accept=".bin">
+        <button type="submit">Update</button>
+        <span id="otaStatus" style="font-size:12px;opacity:0.8"></span>
+      </form>
+    </div>
   </section>
 
 </div>
@@ -274,7 +283,7 @@ function togglePlayPause(){post(isPaused?'/play':'/pause')}
 function setVolume(value){document.querySelector('#vol').textContent=value;clearTimeout(window.volumeTimer);window.volumeTimer=setTimeout(()=>fetch('/volume?value='+value,{method:'POST'}),120)}
 function setSeek(value){clearTimeout(seekTimer);seekTimer=setTimeout(()=>fetch('/seek?position='+value,{method:'POST'}),200)}
 async function setMode(mode){await fetch('/mode?value='+encodeURIComponent(mode),{method:'POST'});refresh()}
-async function refresh(){let s=await (await fetch('/status')).json();isPaused=s.paused;document.querySelector('#playPauseButton').textContent=isPaused?'Play':'Pause';document.querySelector('#title').textContent=s.track;document.querySelector('#vol').textContent=s.volume;document.querySelector('#volume').value=s.volume;document.querySelector('#seek').max=s.duration;document.querySelector('#seek').value=s.position;document.querySelector('#time').textContent=s.positionText+' / '+s.durationText;document.querySelectorAll('[data-mode]').forEach(button=>button.classList.toggle('active',button.dataset.mode===s.mode))}
+async function refresh(){let s=await (await fetch('/status')).json();isPaused=s.paused;document.querySelector('#playPauseButton').textContent=isPaused?'Play':'Pause';document.querySelector('#title').textContent=s.title?(s.artist?s.artist+' – '+s.title:s.title):s.track;document.querySelector('#vol').textContent=s.volume;document.querySelector('#volume').value=s.volume;document.querySelector('#seek').max=s.duration;document.querySelector('#seek').value=s.position;document.querySelector('#time').textContent=s.positionText+' / '+s.durationText;document.querySelectorAll('[data-mode]').forEach(button=>button.classList.toggle('active',button.dataset.mode===s.mode))}
 function parentPath(path){if(path==='/')return '/';let i=path.lastIndexOf('/');return i<=0?'/':path.slice(0,i)}
 const listContainer=document.querySelector('#files');
 async function loadFiles(path){filesPath=path||'/';let entries=await (await fetch('/files?path='+encodeURIComponent(filesPath))).json();document.querySelector('#filesPath').textContent=filesPath;listContainer.replaceChildren();entries.forEach(e=>{const full=e.name==='..'?parentPath(filesPath):(filesPath==='/'?'/'+e.name:filesPath+'/'+e.name);const el=document.createElement('div');el.className='file';el.dataset.path=full;el.dataset.isDir=e.isDirectory?'1':'0';const name=document.createElement('span');name.className='file-name';name.textContent=(e.isDirectory?'[D] ':'')+e.name;el.appendChild(name);if(e.name!=='..'){const actions=document.createElement('div');actions.className='file-actions';for(const action of (e.isDirectory?['delete']:['play','download','delete'])){const button=document.createElement('button');button.dataset.action=action;button.dataset.path=full;button.dataset.name=e.name;button.dataset.isDir=e.isDirectory?'1':'0';button.textContent=action[0].toUpperCase()+action.slice(1);actions.appendChild(button)}el.appendChild(actions)}listContainer.appendChild(el)});if(!entries.length)listContainer.textContent='Empty'}
@@ -283,6 +292,17 @@ document.querySelector('#uploadForm').addEventListener('submit',async(event)=>{e
 async function makeFolder(){const name=document.querySelector('#newFolder').value.trim();if(name)await post('/mkdir?path='+encodeURIComponent((filesPath==='/'?'':filesPath)+'/'+name));loadFiles(filesPath)}
 async function loadConfig(){const c=await (await fetch('/config')).json();document.querySelector('#ssid').value=c.ssid;}
 document.querySelector('#configForm').addEventListener('submit',async(event)=>{event.preventDefault();await fetch('/config',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:'ssid='+encodeURIComponent(document.querySelector('#ssid').value)+'&password='+encodeURIComponent(document.querySelector('#password').value)});alert('Restarting AP');});
+document.querySelector('#otaForm').addEventListener('submit',(event)=>{event.preventDefault();
+const file=document.querySelector('#otaFile').files[0];const status=document.querySelector('#otaStatus');
+if(!file)return;
+if(!file.name.toLowerCase().endsWith('.bin')){alert('Wybierz plik firmware .bin');return}
+if(!confirm('Wgrać nowe firmware '+file.name+'? Odtwarzanie zostanie zatrzymane, a urządzenie zrestartuje się po aktualizacji.'))return;
+const form=new FormData();form.append('firmware',file);
+const xhr=new XMLHttpRequest();xhr.open('POST','/update',true);
+xhr.upload.onprogress=(e)=>{if(e.lengthComputable)status.textContent='Wysyłanie: '+Math.round(e.loaded/e.total*100)+'%'};
+xhr.onload=()=>{if(xhr.status>=200&&xhr.status<300){status.textContent='Gotowe, restart urządzenia…';setTimeout(()=>location.reload(),8000)}else{status.textContent='Błąd';alert(xhr.responseText||'Aktualizacja nieudana')}};
+xhr.onerror=()=>{status.textContent='Błąd';alert('Aktualizacja przerwana (zły plik lub zerwane połączenie)')};
+xhr.send(form)});
 refresh();loadFiles('/');setInterval(refresh,1500);
 loadConfig();
 </script>

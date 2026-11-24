@@ -9,3 +9,7 @@ void registerWebRoutes();
 void webServerStart();
 void webServerStop();
 void webServerHandle();
+
+class WebServer;
+// Dla modułów z handlerami tras poza tym plikiem (np. net/ota.cpp).
+WebServer &webServerInstance();

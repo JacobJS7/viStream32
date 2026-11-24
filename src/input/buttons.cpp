@@ -98,7 +98,7 @@ void buttonsPoll(unsigned long now) {
 			} else if (currentScreen == SCREEN_BROWSER) {
 				moveBrowserSelection(1);
 			} else if (now - nextPressMillis >= LONG_PRESS_MS) {
-				seekByBytes(SEEK_BYTES_10_SECONDS);
+				seekBySeconds(SEEK_STEP_SECONDS);
 			} else {
 				Serial.println("Przycisk NEXT: pomijanie utworu");
 				closeTrack();
@@ -118,7 +118,7 @@ void buttonsPoll(unsigned long now) {
 			} else if (currentScreen == SCREEN_BROWSER) {
 				moveBrowserSelection(-1);
 			} else if (now - prevPressMillis >= LONG_PRESS_MS) {
-				seekByBytes(-static_cast<int32_t>(SEEK_BYTES_10_SECONDS));
+				seekBySeconds(-SEEK_STEP_SECONDS);
 			} else {
 				Serial.println("Przycisk PREV: poprzedni utwór");
 				closeTrack();

@@ -8,10 +8,12 @@
 #include "storage/sd_fs.h"
 #include "storage/persistence.h"
 #include "ui/display.h"
+#include "audio/mp3_info.h"
 
 static ESP32I2SAudio audio(I2S_BCLK, I2S_LRC, I2S_DOUT);
 static BackgroundAudioMP3 mp3(audio);
 static File f;                     // aktualnie odtwarzany plik (sdMutex)
+static Mp3Info trackInfo;          // metadane bieżącego utworu (audioMutex + sdMutex)
 static uint8_t filebuff[512];
 static size_t shuffleCursor = 0;
 static uint32_t trackPositionBaseSec = 0;
@@ -82,18 +84,21 @@ void cyclePlaybackMode() {
 	requestStateSave();
 }
 
+// Przewija otwarty plik do sekundy `sec` (TOC Xing dla VBR, inaczej liniowo).
+// Wymaga audioMutex i sdMutex. Zwraca false gdy brak pliku lub seek się nie udał.
+static bool seekFileToSecond(uint32_t sec) {
+	if (!f) return false;
+	uint32_t offset = mp3ByteOffsetForSecond(trackInfo, sec, static_cast<uint32_t>(f.size()));
+	if (!f.seek(offset)) return false;
+	mp3.flush();
+	return true;
+}
+
 void restorePosition(uint32_t positionSec) {
+	if (positionSec >= currentTrackDurationSec) positionSec = 0;
 	xSemaphoreTake(audioMutex, portMAX_DELAY);
 	xSemaphoreTake(sdMutex, portMAX_DELAY);
-	if (f) {
-		uint32_t fileSize = f.size();
-		// BackgroundAudioMP3 has no time index; use a bitrate-based byte estimate.
-		uint64_t approximateOffset = static_cast<uint64_t>(positionSec) * APPROXIMATE_MP3_BYTES_PER_SECOND;
-		if (fileSize > 0 && approximateOffset >= fileSize) approximateOffset = fileSize - 1;
-		if (f.seek(static_cast<uint32_t>(approximateOffset))) {
-			mp3.flush();
-		}
-	}
+	seekFileToSecond(positionSec);
 	xSemaphoreGive(sdMutex);
 	xSemaphoreGive(audioMutex);
 	resetPlaybackPosition(positionSec);
@@ -110,7 +115,16 @@ bool openTrack(size_t idx) {
 	Serial.println(tracks[idx]);
 	f = SD.open(tracks[idx].c_str());
 	bool opened = f;
-	if (opened) mp3.flush();
+	if (opened) {
+		// Metadane (ID3, bitrate, Xing/VBRI); plik zostaje ustawiony na pierwszej
+		// ramce audio, więc dekoder nie dostaje tagów ani okładki.
+		readMp3Info(f, trackInfo, APPROXIMATE_MP3_BYTES_PER_SECOND);
+		mp3.flush();
+		currentTrackDurationSec = trackInfo.durationSec;
+		currentTrackTitle = trackInfo.title;
+		currentTrackArtist = trackInfo.artist;
+		currentTrackBitrate = trackInfo.bitrateKbps;
+	}
 	xSemaphoreGive(sdMutex);
 	xSemaphoreGive(audioMutex);
 
@@ -118,11 +132,9 @@ bool openTrack(size_t idx) {
 		Serial.println("Nie można otworzyć pliku");
 		return false;
 	}
-	xSemaphoreTake(sdMutex, portMAX_DELAY);
-	uint32_t fileSize = f.size();
-	xSemaphoreGive(sdMutex);
-	// BackgroundAudioMP3 exposes no MP3 bitrate/header metadata; this is a deliberate estimate.
-	currentTrackDurationSec = max(1UL, fileSize / APPROXIMATE_MP3_BYTES_PER_SECOND);
+	Serial.printf("MP3: %s %u kbps %u Hz %s, czas %u s, start audio %u\n",
+			trackInfo.valid ? "OK" : "estymata", trackInfo.bitrateKbps, trackInfo.sampleRate,
+			trackInfo.vbr ? "VBR" : "CBR", currentTrackDurationSec, trackInfo.audioStart);
 	resetPlaybackPosition();
 	return true;
 }
@@ -314,25 +326,24 @@ void stopPlayback() {
 	requestStateSave();
 }
 
-void seekByBytes(int32_t delta) {
+void seekToSecond(uint32_t sec) {
+	uint32_t duration = currentTrackDurationSec;
+	if (duration > 1 && sec >= duration) sec = duration - 1;
 	xSemaphoreTake(audioMutex, portMAX_DELAY);
 	xSemaphoreTake(sdMutex, portMAX_DELAY);
-	if (f && !playbackStopped) {
-		uint32_t position = f.position();
-		uint32_t fileSize = f.size();
-		int64_t target = static_cast<int64_t>(position) + delta;
-		if (target < 0) target = 0;
-		if (fileSize > 0 && target >= fileSize) target = fileSize - 1;
-		if (f.seek(static_cast<uint32_t>(target))) {
-			mp3.flush();
-			uint32_t estimatedPosition = static_cast<uint32_t>(target / APPROXIMATE_MP3_BYTES_PER_SECOND);
-			resetPlaybackPosition(estimatedPosition);
-			Serial.println(delta > 0 ? "Fast forward 10 s" : "Rewind 10 s");
-		}
+	if (!playbackStopped && seekFileToSecond(sec)) {
+		resetPlaybackPosition(sec);
+		Serial.printf("Seek: %u s\n", sec);
 	}
 	xSemaphoreGive(sdMutex);
 	xSemaphoreGive(audioMutex);
 	requestStateSave();
+}
+
+void seekBySeconds(int32_t deltaSec) {
+	updatePlaybackPosition();  // bierze stateMutex — przed audio/sd (kolejność blokad)
+	int64_t target = static_cast<int64_t>(currentPositionSec) + deltaSec;
+	seekToSecond(target < 0 ? 0 : static_cast<uint32_t>(target));
 }
 
 void volumeUp() {
